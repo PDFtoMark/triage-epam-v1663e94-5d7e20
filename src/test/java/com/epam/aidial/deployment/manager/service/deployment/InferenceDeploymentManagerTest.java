@@ -1,0 +1,1786 @@
+package com.epam.aidial.deployment.manager.service.deployment;
+
+import com.epam.aidial.deployment.manager.cleanup.resource.DisposableResourceManager;
+import com.epam.aidial.deployment.manager.cleanup.resource.model.DisposableResource;
+import com.epam.aidial.deployment.manager.configuration.KserveDeployProperties;
+import com.epam.aidial.deployment.manager.configuration.NodePoolProperties;
+import com.epam.aidial.deployment.manager.dao.repository.DeploymentRepository;
+import com.epam.aidial.deployment.manager.exception.DeploymentException;
+import com.epam.aidial.deployment.manager.exception.EntityNotFoundException;
+import com.epam.aidial.deployment.manager.exception.ValidationException;
+import com.epam.aidial.deployment.manager.huggingface.properties.HuggingFaceProperties;
+import com.epam.aidial.deployment.manager.kubernetes.K8sClient;
+import com.epam.aidial.deployment.manager.kubernetes.kserve.K8sKserveClient;
+import com.epam.aidial.deployment.manager.model.DeploymentMetadata;
+import com.epam.aidial.deployment.manager.model.DeploymentStatus;
+import com.epam.aidial.deployment.manager.model.ReconcileConfig;
+import com.epam.aidial.deployment.manager.model.Resources;
+import com.epam.aidial.deployment.manager.model.SimpleEnvVar;
+import com.epam.aidial.deployment.manager.model.SimpleEnvVarValue;
+import com.epam.aidial.deployment.manager.model.deployment.Deployment;
+import com.epam.aidial.deployment.manager.model.deployment.HuggingFaceSource;
+import com.epam.aidial.deployment.manager.model.deployment.InferenceDeployment;
+import com.epam.aidial.deployment.manager.model.deployment.InferenceTask;
+import com.epam.aidial.deployment.manager.service.RegistryPullSecretProvisioner;
+import com.epam.aidial.deployment.manager.service.RegistryPullSecretProvisioner.PullSecretPlan;
+import com.epam.aidial.deployment.manager.service.detection.InferenceTaskDetectionResult;
+import com.epam.aidial.deployment.manager.service.detection.InferenceTaskDetector;
+import com.epam.aidial.deployment.manager.service.manifest.InferenceManifestGenerator;
+import com.epam.aidial.deployment.manager.service.manifest.ManifestGenerator;
+import com.epam.aidial.deployment.manager.service.manifest.TextClassificationTransformerSection;
+import com.epam.aidial.deployment.manager.service.pipeline.specification.CiliumNetworkPolicyCreator;
+import io.cilium.v2.CiliumNetworkPolicy;
+import io.fabric8.kubernetes.api.model.Container;
+import io.fabric8.kubernetes.api.model.ContainerStateBuilder;
+import io.fabric8.kubernetes.api.model.ContainerStatus;
+import io.fabric8.kubernetes.api.model.ObjectMeta;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.PodList;
+import io.fabric8.kubernetes.api.model.PodSpec;
+import io.fabric8.kubernetes.api.model.PodStatus;
+import io.fabric8.kubernetes.client.dsl.ContainerResource;
+import io.fabric8.kubernetes.client.dsl.PodResource;
+import io.kserve.serving.v1beta1.InferenceService;
+import io.kserve.serving.v1beta1.InferenceServiceStatus;
+import io.kserve.serving.v1beta1.inferenceservicestatus.Components;
+import io.kserve.serving.v1beta1.inferenceservicestatus.ModelStatus;
+import io.kserve.serving.v1beta1.inferenceservicestatus.components.Address;
+import io.kserve.serving.v1beta1.inferenceservicestatus.modelstatus.States;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentMatcher;
+import org.mockito.InOrder;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+import java.lang.reflect.Method;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.function.Consumer;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class InferenceDeploymentManagerTest {
+
+    private static final String DEPLOYMENT_ID = String.valueOf(UUID.randomUUID());
+    private static final int STARTUP_TIMEOUT = 60;
+    private static final String NAMESPACE = "test-namespace";
+    private static final String SERVICE_NAME = "dm-" + DEPLOYMENT_ID;
+    private static final String CONTAINER_NAME = "test-container";
+    private static final String POD_NAME = "test-pod";
+    private static final String SERVICE_URL = "http://service-name.test.com";
+    private static final String INTERNAL_SERVICE_URL = "http://service-name.test-namespace.svc.cluster.local";
+    private static final int DEFAULT_KSERVE_SERVICE_PORT = 8080;
+
+    @Mock
+    private DisposableResourceManager disposableResourceManager;
+    @Mock
+    private ManifestGenerator manifestGenerator;
+    @Mock
+    private InferenceManifestGenerator inferenceManifestGenerator;
+    @Mock
+    private ContainerPortResolver containerPortResolver;
+    @Mock
+    private CiliumNetworkPolicyCreator ciliumNetworkPolicyCreator;
+    @Mock
+    private NodePoolProperties nodePoolProperties;
+    @Mock
+    private DeploymentRepository deploymentRepository;
+    @Mock
+    private K8sClient k8sClient;
+    @Mock
+    private K8sKserveClient k8sKserveClient;
+    @Mock
+    private PodResource podResource;
+    @Mock
+    private ContainerResource containerResource;
+    @Mock
+    private CiliumNetworkPolicy ciliumNetworkPolicy;
+    @Mock
+    private InferenceTaskDetector inferenceTaskDetector;
+    @Mock
+    private TextClassificationTransformerSection textClassificationTransformerSection;
+    @Mock
+    private RegistryPullSecretProvisioner registryPullSecretProvisioner;
+
+    private InferenceDeploymentManager inferenceDeploymentManager;
+
+    @BeforeEach
+    void setUp() {
+        var kserveDeployProperties = new KserveDeployProperties();
+        kserveDeployProperties.setNamespace(NAMESPACE);
+        kserveDeployProperties.setStartupTimeout(STARTUP_TIMEOUT);
+        kserveDeployProperties.setUseClusterInternalUrl(false);
+
+        var huggingFaceProperties = new HuggingFaceProperties();
+        inferenceDeploymentManager = new InferenceDeploymentManager(
+                k8sClient,
+                disposableResourceManager,
+                manifestGenerator,
+                inferenceManifestGenerator,
+                containerPortResolver,
+                ciliumNetworkPolicyCreator,
+                nodePoolProperties,
+                deploymentRepository,
+                k8sKserveClient,
+                kserveDeployProperties,
+                huggingFaceProperties,
+                inferenceTaskDetector,
+                textClassificationTransformerSection,
+                registryPullSecretProvisioner
+        );
+        lenient().when(inferenceTaskDetector.detect(any())).thenReturn(InferenceTaskDetectionResult.none());
+        lenient().when(registryPullSecretProvisioner.plan(anyString(), anyString(), any()))
+                .thenReturn(PullSecretPlan.none());
+
+        TransactionSynchronizationManager.initSynchronization();
+    }
+
+    @AfterEach
+    void tearDown() {
+        TransactionSynchronizationManager.clear();
+    }
+
+    @Test
+    void getActiveInstances_shouldReturnListOfReadyPods() {
+        // Given
+        var podList = new PodList();
+        var readyPod = createPod("ready-pod", true);
+        var notReadyPod = createPod("not-ready-pod", false);
+        podList.setItems(List.of(readyPod, notReadyPod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When
+        var result = inferenceDeploymentManager.getActiveInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).hasSize(1);
+        assertThat(result.getFirst().getName()).isEqualTo("ready-pod");
+    }
+
+    @Test
+    void getActiveInstances_shouldReturnEmptyListWhenNoPodsFound() {
+        // Given
+        var emptyPodList = new PodList();
+        emptyPodList.setItems(Collections.emptyList());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(emptyPodList);
+
+        // When
+        var result = inferenceDeploymentManager.getActiveInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void getActiveInstances_shouldThrowExceptionWhenContainerMissing() {
+        // Given
+        var podList = new PodList();
+        var pod = new Pod();
+        pod.setMetadata(new ObjectMeta());
+        pod.getMetadata().setName("pod-without-container");
+        pod.getMetadata().setCreationTimestamp(Instant.now().toString());
+        var status = new PodStatus();
+        status.setContainerStatuses(Collections.emptyList());
+        pod.setStatus(status);
+        podList.setItems(List.of(pod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When/Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.getActiveInstances(DEPLOYMENT_ID))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("A container is missing in the service pod");
+    }
+
+    @Test
+    void getInstances_shouldReturnPodsWithRestartInfo() {
+        // Given
+        var podList = new PodList();
+        var pod = createPodWithRestartInfo("pod-with-restarts", 5, "OOMKilled", 137, 9);
+        podList.setItems(List.of(pod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When
+        var result = inferenceDeploymentManager.getInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).hasSize(1);
+        var podInfo = result.getFirst();
+        assertThat(podInfo.getName()).isEqualTo("pod-with-restarts");
+        assertThat(podInfo.getRestartCount()).isEqualTo(5);
+        assertThat(podInfo.getLastTerminationReason()).isEqualTo("OOMKilled");
+        assertThat(podInfo.getLastExitCode()).isEqualTo(137);
+        assertThat(podInfo.getLastSignal()).isEqualTo(9);
+    }
+
+    @Test
+    void getInstances_shouldReturnPodsWithoutTerminationInfo() {
+        // Given
+        var podList = new PodList();
+        var pod = createPod("pod-no-restarts", true);
+        podList.setItems(List.of(pod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When
+        var result = inferenceDeploymentManager.getInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).hasSize(1);
+        var podInfo = result.getFirst();
+        assertThat(podInfo.getName()).isEqualTo("pod-no-restarts");
+        assertThat(podInfo.getRestartCount()).isEqualTo(0);
+        assertThat(podInfo.getLastTerminationReason()).isNull();
+        assertThat(podInfo.getLastExitCode()).isNull();
+        assertThat(podInfo.getLastSignal()).isNull();
+    }
+
+    @Test
+    void getInstances_shouldAggregateRestartCountsFromMultipleContainers() {
+        // Given
+        var podList = new PodList();
+        var pod = createPodWithMultipleContainers("pod-multi-container", 3, 2);
+        podList.setItems(List.of(pod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When
+        var result = inferenceDeploymentManager.getInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).hasSize(1);
+        var podInfo = result.getFirst();
+        assertThat(podInfo.getName()).isEqualTo("pod-multi-container");
+        assertThat(podInfo.getRestartCount()).isEqualTo(5); // 3 + 2
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldReturnContainerResourceForRunningPod() {
+        // Given
+        Pod pod = createPod(POD_NAME, true);
+        pod.getStatus().getContainerStatuses().getFirst()
+                .setState(new ContainerStateBuilder().withNewRunning().endRunning().build());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+        when(k8sClient.getPodResource(NAMESPACE, POD_NAME)).thenReturn(podResource);
+        when(podResource.inContainer(CONTAINER_NAME)).thenReturn(containerResource);
+
+        // When
+        ContainerResource result = inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false);
+
+        // Then
+        assertThat(result).isEqualTo(containerResource);
+        verify(k8sKserveClient).getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME);
+        verify(k8sClient).getPodResource(NAMESPACE, POD_NAME);
+        verify(podResource).inContainer(CONTAINER_NAME);
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldThrowExceptionWhenPodNotFound() {
+        // Given
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(null);
+
+        // When / Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false))
+                .isInstanceOf(EntityNotFoundException.class)
+                .hasMessage("Pod is not found for deployment '%s'".formatted(DEPLOYMENT_ID));
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldThrowExceptionWhenContainerNotFound() {
+        // Given
+        Pod pod = new Pod();
+        pod.setMetadata(new ObjectMeta());
+        pod.setSpec(new PodSpec());
+        pod.getSpec().setContainers(Collections.emptyList());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+
+        // When/Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Container not found for pod");
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldThrowWhenContainerStatusIsEmpty() {
+        // Given
+        Pod pod = createPod(POD_NAME, true);
+        pod.getStatus().setContainerStatuses(Collections.emptyList());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+
+        // When / Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Container is not ready for log streaming for deployment '%s'".formatted(DEPLOYMENT_ID));
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldThrowWhenContainerStatusNotFoundByName() {
+        // Given
+        Pod pod = createPod(POD_NAME, true);
+        pod.getStatus().getContainerStatuses().getFirst().setName("other-container");
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+
+        // When / Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false))
+                .isInstanceOf(EntityNotFoundException.class)
+                .hasMessage("Container is not found for deployment '%s'".formatted(DEPLOYMENT_ID));
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldThrowWhenContainerIsNotRunning() {
+        // Given
+        Pod pod = createPod(POD_NAME, false); // waiting state
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+
+        // When / Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Container is not running for deployment '%s'".formatted(DEPLOYMENT_ID));
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldThrowWhenContainerIsTerminated() {
+        // Given
+        Pod pod = createPod(POD_NAME, true);
+        pod.getStatus().getContainerStatuses().getFirst()
+                .setState(new ContainerStateBuilder().withNewTerminated().endTerminated().build());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+
+        // When / Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Container is not running for deployment '%s'".formatted(DEPLOYMENT_ID));
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldThrowWhenPreviousLogsNotAvailable() {
+        // Given
+        Pod pod = createPod(POD_NAME, true);
+        pod.getStatus().getContainerStatuses().getFirst()
+                .setState(new ContainerStateBuilder().withNewRunning().endRunning().build());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+
+        // When / Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, true))
+                .isInstanceOf(ValidationException.class)
+                .hasMessage("Previous logs are not available for container in deployment '%s'".formatted(DEPLOYMENT_ID));
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldReturnContainerResourceForPreviousLogs() {
+        // Given
+        Pod pod = createPod(POD_NAME, true);
+        var containerStatus = pod.getStatus().getContainerStatuses().getFirst();
+        containerStatus.setState(new ContainerStateBuilder().withNewRunning().endRunning().build());
+        containerStatus.setLastState(new ContainerStateBuilder().withNewTerminated().endTerminated().build());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKserveClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+        when(k8sClient.getPodResource(NAMESPACE, POD_NAME)).thenReturn(podResource);
+        when(podResource.inContainer(CONTAINER_NAME)).thenReturn(containerResource);
+
+        // When
+        ContainerResource result = inferenceDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, true);
+
+        // Then
+        assertThat(result).isEqualTo(containerResource);
+    }
+
+    @Test
+    void deploy_shouldDeployInferenceService() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        deployment.setServiceName(null);
+        InferenceService serviceSpec = new InferenceService();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+        Integer containerPort = 8080;
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT)))
+                .thenReturn(containerPort);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), eq(false)))
+                .thenReturn(ciliumNetworkPolicy);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(containerPort), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+
+        // When
+        Deployment result = inferenceDeploymentManager.deploy(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        assertThat(result.getStatus()).isEqualTo(DeploymentStatus.PENDING);
+        assertThat(result.getServiceName()).isEqualTo(SERVICE_NAME);
+
+        verify(disposableResourceManager).saveInferenceServiceResource(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), eq(NAMESPACE));
+        verify(k8sKserveClient).createService(eq(NAMESPACE), eq(serviceSpec));
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.PENDING));
+        verify(deploymentRepository).updateServiceName(eq(DEPLOYMENT_ID), eq(SERVICE_NAME));
+
+        // Cilium policy created with deployment domains list (no default domains).
+        // Inference path always routes through the 6-arg overload via buildCiliumNetworkPolicy;
+        // chained=false here because the stubbed serviceSpec carries no transformer block.
+        verify(ciliumNetworkPolicyCreator).create(
+                eq(NAMESPACE),
+                anyString(),
+                eq(SERVICE_NAME),
+                argThat((List<String> domains) ->
+                    domains.contains("test-domain-1")
+                        && domains.contains("test-domain-2")
+                        && domains.size() == 2),
+                any(),
+                eq(false)
+        );
+    }
+
+    @Test
+    void deploy_shouldPassChainedFlagToCiliumPolicyCreator_whenTransformerEmitted() {
+        // Given: the manifest generator emits an InferenceService with a transformer block —
+        // that's the source of truth for the chained signal in the refactored design (the hook
+        // reads `serviceSpec.getSpec().getTransformer()` directly, not the detection result).
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        deployment.setServiceName(null);
+        InferenceService serviceSpec = createInferenceServiceWithTransformer();
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), eq(true)))
+                .thenReturn(ciliumNetworkPolicy);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(8080), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+        when(inferenceTaskDetector.detect(any()))
+                .thenReturn(InferenceTaskDetectionResult.textClassification(Map.of(0, "NEGATIVE", 1, "POSITIVE")));
+
+        // When
+        inferenceDeploymentManager.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then: chained-mode creator overload called with chainedTransformer=true
+        verify(ciliumNetworkPolicyCreator).create(
+                eq(NAMESPACE),
+                anyString(),
+                eq(SERVICE_NAME),
+                anyList(),
+                any(),
+                eq(true)
+        );
+        // The hook on the deploy path reads chained-ness from the in-flight serviceSpec — no
+        // cluster read required.
+        verify(k8sKserveClient, never()).getService(anyString(), anyString());
+    }
+
+    @Test
+    void deploy_shouldInjectTransformerImagePullSecret_whenTransformerImageMatchesCredentialedRegistry() {
+        // Given: a chained text-classification deployment whose transformer image is in a credentialed registry
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        deployment.setServiceName(SERVICE_NAME);
+        InferenceService serviceSpec = createInferenceServiceWithTransformer();
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(8080), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+        when(inferenceTaskDetector.detect(any()))
+                .thenReturn(InferenceTaskDetectionResult.textClassification(Map.of(0, "NEGATIVE", 1, "POSITIVE")));
+        when(textClassificationTransformerSection.transformerImage()).thenReturn("priv.registry/transformer:1");
+        when(registryPullSecretProvisioner.plan(eq(DEPLOYMENT_ID), eq(NAMESPACE), any()))
+                .thenReturn(PullSecretPlan.provision("test-pull-secret", null));
+
+        // When
+        inferenceDeploymentManager.deploy(DEPLOYMENT_ID);
+
+        // Then: the provisioned pull secret name is wired into the transformer block (predictor untouched)
+        var pullSecrets = serviceSpec.getSpec().getTransformer().getImagePullSecrets();
+        assertThat(pullSecrets).hasSize(1);
+        assertThat(pullSecrets.get(0).getName()).isEqualTo("test-pull-secret");
+    }
+
+    @Test
+    void updateCiliumNetworkPolicy_shouldPreserveChainedAugmentation_onAllowedDomainsUpdate() {
+        // Given: a chained-mode inference deployment whose allowedDomains the operator is updating.
+        // The chained signal is sourced from the live K8s InferenceService — no HuggingFace Hub call.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(k8sKserveClient.getService(NAMESPACE, SERVICE_NAME))
+                .thenReturn(createInferenceServiceWithTransformer());
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), eq(true)))
+                .thenReturn(ciliumNetworkPolicy);
+        when(ciliumNetworkPolicy.getMetadata()).thenReturn(new ObjectMeta());
+
+        // When
+        inferenceDeploymentManager.updateCiliumNetworkPolicy(DEPLOYMENT_ID);
+
+        // Then: chained-mode augmentation preserved (6-arg overload with chainedTransformer=true)
+        verify(ciliumNetworkPolicyCreator).create(
+                eq(NAMESPACE),
+                anyString(),
+                eq(SERVICE_NAME),
+                anyList(),
+                any(),
+                eq(true)
+        );
+        // Spec 022 FR-005: the chained signal must come from cluster state, not a separate HF Hub fetch.
+        verify(inferenceTaskDetector, never()).detect(any());
+        // The K8s update actually went through.
+        verify(k8sClient).updateCiliumNetworkPolicy(eq(NAMESPACE), eq(ciliumNetworkPolicy));
+    }
+
+    @Test
+    void updateCiliumNetworkPolicy_shouldEmitBaselinePolicy_whenClusterServicePredictorOnly() {
+        // Given: cluster InferenceService has no transformer block → baseline (non-chained) policy.
+        // The refactored inference path always routes through the 6-arg overload; the chained flag
+        // is the differentiator, not the call shape.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(k8sKserveClient.getService(NAMESPACE, SERVICE_NAME))
+                .thenReturn(createInferenceServiceWithoutTransformer());
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), eq(false)))
+                .thenReturn(ciliumNetworkPolicy);
+        when(ciliumNetworkPolicy.getMetadata()).thenReturn(new ObjectMeta());
+
+        // When
+        inferenceDeploymentManager.updateCiliumNetworkPolicy(DEPLOYMENT_ID);
+
+        // Then: 6-arg overload invoked with chained=false — byte-equivalent to the legacy 5-arg
+        // output per CiliumNetworkPolicyCreatorTest#shouldProduceIdenticalPolicyTo5ArgOverload_whenChainedFalse.
+        verify(ciliumNetworkPolicyCreator).create(
+                eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), eq(false));
+        verify(ciliumNetworkPolicyCreator, never()).create(
+                anyString(), anyString(), anyString(), anyList(), any(), eq(true));
+        // Spec 022 FR-005: no HF Hub re-fetch on this path — chained signal sourced from cluster.
+        verify(inferenceTaskDetector, never()).detect(any());
+    }
+
+    @Test
+    void updateCiliumNetworkPolicy_shouldFail_whenLiveServiceMissing() {
+        // Given: the K8s InferenceService is unexpectedly absent (delete race, RBAC, etc.).
+        // The endpoint MUST NOT silently downgrade the policy to non-chained — that would
+        // re-create the very failure mode spec 022 fixes.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(k8sKserveClient.getService(NAMESPACE, SERVICE_NAME)).thenReturn(null);
+
+        assertThatThrownBy(() -> inferenceDeploymentManager.updateCiliumNetworkPolicy(DEPLOYMENT_ID))
+                .isInstanceOf(DeploymentException.class)
+                .hasMessageContaining(DEPLOYMENT_ID)
+                .hasRootCauseInstanceOf(IllegalStateException.class)
+                .hasStackTraceContaining("InferenceService '%s' not found".formatted(SERVICE_NAME));
+
+        // No policy was written — the IllegalStateException short-circuits before any creator call.
+        verify(ciliumNetworkPolicyCreator, never()).create(
+                anyString(), anyString(), anyString(), anyList(), any());
+        verify(ciliumNetworkPolicyCreator, never()).create(
+                anyString(), anyString(), anyString(), anyList(), any(), anyBoolean());
+        verify(k8sClient, never()).updateCiliumNetworkPolicy(anyString(), any());
+    }
+
+    @Test
+    void updateCiliumNetworkPolicy_shouldCreateInstead_whenK8sUpdateReturns404() {
+        // Given: the CNP does not exist in the cluster (e.g. cilium-policies was disabled at
+        // deploy time and has since been flipped on). The update path must catch the 404 and
+        // create the policy instead of bubbling the failure.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(k8sKserveClient.getService(NAMESPACE, SERVICE_NAME))
+                .thenReturn(createInferenceServiceWithTransformer());
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), anyBoolean()))
+                .thenReturn(ciliumNetworkPolicy);
+        when(ciliumNetworkPolicy.getMetadata()).thenReturn(new ObjectMeta());
+        doThrow(new io.fabric8.kubernetes.client.KubernetesClientException("not found", 404, null))
+                .when(k8sClient).updateCiliumNetworkPolicy(eq(NAMESPACE), eq(ciliumNetworkPolicy));
+
+        // When
+        inferenceDeploymentManager.updateCiliumNetworkPolicy(DEPLOYMENT_ID);
+
+        // Then: after the 404, the policy is created and registered as a disposable resource.
+        verify(k8sClient).updateCiliumNetworkPolicy(eq(NAMESPACE), eq(ciliumNetworkPolicy));
+        verify(k8sClient).createCiliumNetworkPolicy(eq(NAMESPACE), eq(ciliumNetworkPolicy));
+        verify(disposableResourceManager).saveK8sResources(
+                eq(List.of(ciliumNetworkPolicy)),
+                eq(com.epam.aidial.deployment.manager.cleanup.resource.model.K8sResourceKind.CILIUM_NETWORK_POLICY),
+                eq(DEPLOYMENT_ID),
+                eq(NAMESPACE));
+    }
+
+    @Test
+    void updateCiliumNetworkPolicy_shouldPropagate_whenK8sUpdateNon404Error() {
+        // Non-404 errors must NOT be silently swallowed by the create-on-404 fallback.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(k8sKserveClient.getService(NAMESPACE, SERVICE_NAME))
+                .thenReturn(createInferenceServiceWithTransformer());
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), anyBoolean()))
+                .thenReturn(ciliumNetworkPolicy);
+        when(ciliumNetworkPolicy.getMetadata()).thenReturn(new ObjectMeta());
+        doThrow(new io.fabric8.kubernetes.client.KubernetesClientException("forbidden", 403, null))
+                .when(k8sClient).updateCiliumNetworkPolicy(eq(NAMESPACE), eq(ciliumNetworkPolicy));
+
+        assertThatThrownBy(() -> inferenceDeploymentManager.updateCiliumNetworkPolicy(DEPLOYMENT_ID))
+                .isInstanceOf(DeploymentException.class)
+                .hasRootCauseInstanceOf(io.fabric8.kubernetes.client.KubernetesClientException.class);
+        verify(k8sClient, never()).createCiliumNetworkPolicy(anyString(), any());
+    }
+
+    @Test
+    void updateCiliumNetworkPolicy_shouldPropagate_whenK8sClientThrows() {
+        // Given: the cluster read fails transiently. The endpoint must surface the failure
+        // wrapped as DeploymentException so the operator retries instead of seeing a 200.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(k8sKserveClient.getService(NAMESPACE, SERVICE_NAME))
+                .thenThrow(new RuntimeException("kube-apiserver unreachable"));
+
+        assertThatThrownBy(() -> inferenceDeploymentManager.updateCiliumNetworkPolicy(DEPLOYMENT_ID))
+                .isInstanceOf(DeploymentException.class)
+                .hasRootCauseInstanceOf(RuntimeException.class)
+                .hasStackTraceContaining("kube-apiserver unreachable");
+
+        verify(k8sClient, never()).updateCiliumNetworkPolicy(anyString(), any());
+    }
+
+    @Test
+    void rollingUpdate_shouldRefreshCiliumPolicy_whenTopologyFlipsToChained() {
+        // Given: a running deployment whose modelName flip causes prepareServiceSpec to emit a
+        // chained InferenceService (the manifest carries a transformer block) — the CNP must be
+        // refreshed in lock-step inside rollingUpdate's afterCommit.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        InferenceService serviceSpec = createInferenceServiceWithTransformer();
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), eq(true)))
+                .thenReturn(ciliumNetworkPolicy);
+        when(ciliumNetworkPolicy.getMetadata()).thenReturn(new ObjectMeta());
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(8080), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+        when(inferenceTaskDetector.detect(any()))
+                .thenReturn(InferenceTaskDetectionResult.textClassification(Map.of(0, "A", 1, "B")));
+
+        // When
+        inferenceDeploymentManager.rollingUpdate(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then: service was updated AND the CNP was refreshed with chainedTransformer=true (spec 022 FR-007).
+        verify(k8sKserveClient).updateService(eq(NAMESPACE), eq(serviceSpec));
+        verify(ciliumNetworkPolicyCreator).create(
+                eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), eq(true));
+        verify(k8sClient).updateCiliumNetworkPolicy(eq(NAMESPACE), eq(ciliumNetworkPolicy));
+
+        // CNP refresh MUST happen before the service update — half-applied flips that update the
+        // service first and the policy second can re-create bug #87 if the CNP write fails.
+        InOrder order = inOrder(k8sClient, k8sKserveClient);
+        order.verify(k8sClient).updateCiliumNetworkPolicy(eq(NAMESPACE), eq(ciliumNetworkPolicy));
+        order.verify(k8sKserveClient).updateService(eq(NAMESPACE), eq(serviceSpec));
+    }
+
+    @Test
+    void rollingUpdate_shouldApplyPullSecretBeforeServiceUpdate_andCondemnStaleOnlyAfter() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        InferenceService serviceSpec = createInferenceServiceWithoutTransformer();
+        var pullSecretPlan = PullSecretPlan.provision("test-pull-secret", null);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(8080), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+        when(registryPullSecretProvisioner.plan(eq(DEPLOYMENT_ID), eq(NAMESPACE), any()))
+                .thenReturn(pullSecretPlan);
+
+        // When
+        inferenceDeploymentManager.rollingUpdate(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then: the secret is provisioned BEFORE the CRD is re-applied and stale secrets are condemned
+        // only AFTER the CRD apply succeeded (a failed update must never condemn a secret the live,
+        // possibly scaled-to-zero, revision still references).
+        InOrder order = inOrder(registryPullSecretProvisioner, k8sKserveClient);
+        order.verify(registryPullSecretProvisioner).apply(eq(DEPLOYMENT_ID), eq(NAMESPACE), eq(pullSecretPlan));
+        order.verify(k8sKserveClient).updateService(eq(NAMESPACE), eq(serviceSpec));
+        order.verify(registryPullSecretProvisioner).condemnStale(eq(DEPLOYMENT_ID), eq(NAMESPACE), eq(pullSecretPlan));
+    }
+
+    @Test
+    void rollingUpdate_shouldNotFail_whenCondemnStaleThrows() {
+        // Given: condemnation failure is only a leak (reclaimed on the next redeploy) — it must not
+        // fail the otherwise-successful rolling update.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        InferenceService serviceSpec = createInferenceServiceWithoutTransformer();
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(8080), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+        when(registryPullSecretProvisioner.plan(eq(DEPLOYMENT_ID), eq(NAMESPACE), any()))
+                .thenReturn(PullSecretPlan.provision("test-pull-secret", null));
+        doThrow(new RuntimeException("condemn failed")).when(registryPullSecretProvisioner)
+                .condemnStale(eq(DEPLOYMENT_ID), eq(NAMESPACE), any());
+
+        // When: firing afterCommit must not propagate the condemnation failure.
+        inferenceDeploymentManager.rollingUpdate(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        verify(k8sKserveClient).updateService(eq(NAMESPACE), eq(serviceSpec));
+    }
+
+    private InferenceService createInferenceServiceWithTransformer() {
+        InferenceService service = new InferenceService();
+        ObjectMeta metadata = new ObjectMeta();
+        metadata.setName(SERVICE_NAME);
+        service.setMetadata(metadata);
+        var spec = new io.kserve.serving.v1beta1.InferenceServiceSpec();
+        spec.setTransformer(new io.kserve.serving.v1beta1.inferenceservicespec.Transformer());
+        service.setSpec(spec);
+        return service;
+    }
+
+    private InferenceService createInferenceServiceWithoutTransformer() {
+        InferenceService service = new InferenceService();
+        ObjectMeta metadata = new ObjectMeta();
+        metadata.setName(SERVICE_NAME);
+        service.setMetadata(metadata);
+        service.setSpec(new io.kserve.serving.v1beta1.InferenceServiceSpec());
+        return service;
+    }
+
+    /**
+     * Builds an InferenceService whose mapStatus path exercises the chained-deployment branch:
+     * {@code spec.transformer} is set so {@code isChainedDeployment(...)} returns true, and the
+     * caller controls (a) whether {@code status.components} carries a "transformer" entry at all,
+     * and (b) which of {@code transformer.url} / {@code transformer.address.url} is populated —
+     * the two fields {@code isTransformerReady(...)} inspects.
+     */
+    private InferenceService createChainedInferenceServiceWithStatusAndTransformer(
+            States.ActiveModelState activeModelState,
+            ModelStatus.TransitionStatus transitionStatus,
+            String predictorUrl,
+            String transformerUrl,
+            String transformerAddressUrl,
+            boolean includeTransformerComponent) {
+        InferenceService service = new InferenceService();
+        ObjectMeta metadata = new ObjectMeta();
+        metadata.setName(SERVICE_NAME);
+        service.setMetadata(metadata);
+
+        var spec = new io.kserve.serving.v1beta1.InferenceServiceSpec();
+        spec.setTransformer(new io.kserve.serving.v1beta1.inferenceservicespec.Transformer());
+        service.setSpec(spec);
+
+        var status = new InferenceServiceStatus();
+
+        Components predictor = new Components();
+        if (predictorUrl != null) {
+            predictor.setUrl(predictorUrl);
+        }
+        java.util.Map<String, Components> components = new java.util.HashMap<>();
+        components.put("predictor", predictor);
+
+        if (includeTransformerComponent) {
+            Components transformer = new Components();
+            if (transformerUrl != null) {
+                transformer.setUrl(transformerUrl);
+            }
+            if (transformerAddressUrl != null) {
+                Address address = new Address();
+                address.setUrl(transformerAddressUrl);
+                transformer.setAddress(address);
+            }
+            components.put("transformer", transformer);
+        }
+        status.setComponents(components);
+
+        ModelStatus modelStatus = new ModelStatus();
+        modelStatus.setTransitionStatus(transitionStatus);
+        States states = new States();
+        states.setActiveModelState(activeModelState);
+        modelStatus.setStates(states);
+        status.setModelStatus(modelStatus);
+
+        service.setStatus(status);
+        return service;
+    }
+
+    @Test
+    void deploy_shouldPassUnchainedFlag_whenPredictorOnly() {
+        // Given: manifest generator emits a predictor-only InferenceService (no transformer block).
+        // The refactored inference path always routes through the 6-arg overload; chained=false
+        // here so the produced policy is byte-equivalent to the legacy 5-arg baseline.
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        deployment.setServiceName(null);
+        InferenceService serviceSpec = new InferenceService();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), eq(false)))
+                .thenReturn(ciliumNetworkPolicy);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(8080), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+
+        // When
+        inferenceDeploymentManager.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then: 6-arg overload invoked with chained=false; the chained=true variant must NOT fire.
+        verify(ciliumNetworkPolicyCreator).create(
+                eq(NAMESPACE),
+                anyString(),
+                eq(SERVICE_NAME),
+                anyList(),
+                any(),
+                eq(false)
+        );
+        verify(ciliumNetworkPolicyCreator, never()).create(
+                anyString(), anyString(), anyString(), anyList(), any(), eq(true));
+        // Deploy path doesn't read the cluster — chained signal sourced from the in-flight spec.
+        verify(k8sKserveClient, never()).getService(anyString(), anyString());
+    }
+
+    @Test
+    void deploy_shouldMergeDefaultAllowedDomainsWithDeploymentDomainsForHuggingFaceSource() {
+        // Given: HuggingFace source with deployment-specific domains and config default domains
+        var huggingFaceProperties = createHuggingFacePropertiesWithDefaultDomains();
+        var managerWithDefaults = getInferenceDeploymentManager(huggingFaceProperties);
+
+        InferenceDeployment deployment = (InferenceDeployment) createDeployment(DeploymentStatus.STOPPED);
+        deployment.setSource(new HuggingFaceSource("org/model"));
+        deployment.setAllowedDomains(List.of("custom.com"));
+
+        InferenceService serviceSpec = new InferenceService();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), anyBoolean()))
+                .thenReturn(ciliumNetworkPolicy);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(8080), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+
+        // When
+        managerWithDefaults.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then: Cilium policy created with merged list (deployment domains + default domains, no duplicates).
+        // Inference path uses the 6-arg overload; chained flag is irrelevant to this assertion.
+        verify(ciliumNetworkPolicyCreator).create(
+                eq(NAMESPACE),
+                anyString(),
+                eq(SERVICE_NAME),
+                argThat((List<String> domains) ->
+                        domains.contains("custom.com")
+                                && domains.contains("huggingface.co")
+                                && domains.contains("cdn.huggingface.co")
+                                && domains.size() == 3),
+                any(),
+                anyBoolean()
+        );
+    }
+
+    @Test
+    void enrichBeforePersist_shouldSetDetectedTask_forHuggingFaceSource() {
+        InferenceDeployment deployment = (InferenceDeployment) createDeployment(DeploymentStatus.NOT_DEPLOYED);
+        deployment.setSource(new HuggingFaceSource("org/generative-model"));
+        when(inferenceTaskDetector.detect(any())).thenReturn(InferenceTaskDetectionResult.textGeneration());
+
+        inferenceDeploymentManager.enrichBeforePersist(deployment);
+
+        assertThat(deployment.getInferenceTask()).isEqualTo(InferenceTask.TEXT_GENERATION);
+    }
+
+    @Test
+    void enrichBeforePersist_shouldLeaveTaskUnset_whenSourceIsNotHuggingFace() {
+        InferenceDeployment deployment = (InferenceDeployment) createDeployment(DeploymentStatus.NOT_DEPLOYED);
+        deployment.setSource(null);
+
+        inferenceDeploymentManager.enrichBeforePersist(deployment);
+
+        assertThat(deployment.getInferenceTask()).isNull();
+        verify(inferenceTaskDetector, never()).detect(any());
+    }
+
+    @Test
+    void deploy_shouldUseOnlyDefaultAllowedDomainsWhenDeploymentDomainsEmptyWithHuggingFaceSource() {
+        // Given: HuggingFace source with empty deployment allowedDomains
+        var huggingFaceProperties = createHuggingFacePropertiesWithDefaultDomains();
+        var managerWithDefaults = getInferenceDeploymentManager(huggingFaceProperties);
+
+        InferenceDeployment deployment = (InferenceDeployment) createDeployment(DeploymentStatus.STOPPED);
+        deployment.setSource(new HuggingFaceSource("org/model"));
+        deployment.setAllowedDomains(Collections.emptyList());
+
+        InferenceService serviceSpec = new InferenceService();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), any(), anyBoolean()))
+                .thenReturn(ciliumNetworkPolicy);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(8080), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+
+        // When
+        managerWithDefaults.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then: only default allowed domains appear in Cilium policy (6-arg overload, chained flag irrelevant).
+        verify(ciliumNetworkPolicyCreator).create(
+                eq(NAMESPACE),
+                anyString(),
+                eq(SERVICE_NAME),
+                argThat((List<String> domains) ->
+                        domains.contains("huggingface.co")
+                                && domains.contains("cdn.huggingface.co")
+                                && domains.size() == 2),
+                any(),
+                anyBoolean()
+        );
+    }
+
+    private InferenceDeploymentManager getInferenceDeploymentManager(HuggingFaceProperties huggingFaceProperties) {
+        var kserveDeployProperties = new KserveDeployProperties();
+        kserveDeployProperties.setNamespace(NAMESPACE);
+        kserveDeployProperties.setStartupTimeout(STARTUP_TIMEOUT);
+        kserveDeployProperties.setUseClusterInternalUrl(false);
+        return new InferenceDeploymentManager(
+                k8sClient,
+                disposableResourceManager,
+                manifestGenerator,
+                inferenceManifestGenerator,
+                containerPortResolver,
+                ciliumNetworkPolicyCreator,
+                nodePoolProperties,
+                deploymentRepository,
+                k8sKserveClient,
+                kserveDeployProperties, huggingFaceProperties,
+                inferenceTaskDetector,
+                textClassificationTransformerSection,
+                registryPullSecretProvisioner
+        );
+    }
+
+    @Test
+    void deploy_shouldReturnExistingDeploymentIfAlreadyActive() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        // When
+        Deployment result = inferenceDeploymentManager.deploy(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        verify(k8sKserveClient, never()).createService(anyString(), any());
+        verify(deploymentRepository, never()).updateStatus(any(), any());
+        verify(deploymentRepository, never()).updateServiceName(any(), any());
+    }
+
+    @Test
+    void deploy_shouldThrowExceptionWhenDeploymentNotFound() {
+        // Given
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.empty());
+
+        // When/Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.deploy(DEPLOYMENT_ID))
+                .isInstanceOf(EntityNotFoundException.class)
+                .hasMessageContaining("Deployment not found");
+    }
+
+    @Test
+    void deploy_shouldHandleExceptionDuringDeployment() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        InferenceService serviceSpec = new InferenceService();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(inferenceManifestGenerator.serviceConfig(
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+        doThrow(new RuntimeException("Test exception")).when(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), any());
+
+        // When/Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.deploy(DEPLOYMENT_ID))
+                .isInstanceOf(DeploymentException.class)
+                .hasMessageContaining("Failed to deploy service");
+
+        verify(disposableResourceManager).markInferenceServiceResourceForCleanup(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), eq(NAMESPACE));
+    }
+
+    @Test
+    void undeploy_shouldUndeployInferenceService() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        deployment.setUrl(SERVICE_URL);
+        DisposableResource disposableResource = mock(DisposableResource.class);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(disposableResourceManager.markInferenceServiceResourceForCleanup(DEPLOYMENT_ID, SERVICE_NAME, NAMESPACE))
+                .thenReturn(List.of(disposableResource));
+
+        // When
+        Deployment result = inferenceDeploymentManager.undeploy(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        assertThat(result.getStatus()).isEqualTo(DeploymentStatus.STOPPING);
+
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.STOPPING));
+        verify(k8sKserveClient).deleteService(eq(NAMESPACE), eq(SERVICE_NAME));
+        verify(disposableResourceManager).deleteAll(List.of(disposableResource));
+    }
+
+    @Test
+    void undeploy_shouldReturnExistingDeploymentIfAlreadyInactive() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        // When
+        Deployment result = inferenceDeploymentManager.undeploy(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        verify(k8sKserveClient, never()).deleteService(anyString(), anyString());
+        verify(deploymentRepository, never()).updateStatus(any(), any());
+    }
+
+    @Test
+    void undeploy_shouldReturnExistingDeploymentIfStopping() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPING);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        // When
+        Deployment result = inferenceDeploymentManager.undeploy(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        verify(k8sKserveClient, never()).deleteService(anyString(), anyString());
+        verify(deploymentRepository, never()).update(any(), any());
+    }
+
+    @Test
+    void undeploy_shouldThrowExceptionWhenDeploymentNotFound() {
+        // Given
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.empty());
+
+        // When/Then
+        assertThatThrownBy(() -> inferenceDeploymentManager.undeploy(DEPLOYMENT_ID))
+                .isInstanceOf(EntityNotFoundException.class)
+                .hasMessageContaining("Deployment not found");
+    }
+
+    @Test
+    void undeploy_shouldHandleExceptionDuringUndeployment() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        DisposableResource disposableResource = mock(DisposableResource.class);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(disposableResourceManager.markInferenceServiceResourceForCleanup(DEPLOYMENT_ID, SERVICE_NAME, NAMESPACE))
+                .thenReturn(List.of(disposableResource));
+        doThrow(new RuntimeException("Test exception")).when(k8sKserveClient).deleteService(NAMESPACE, SERVICE_NAME);
+
+        // When
+        inferenceDeploymentManager.undeploy(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        // This should throw the exception
+        var synchronizations = TransactionSynchronizationManager.getSynchronizations();
+        assertThatThrownBy(() -> {
+            for (TransactionSynchronization sync : synchronizations) {
+                sync.afterCommit();
+            }
+        })
+                .isInstanceOf(DeploymentException.class)
+                .hasMessageContaining("Unexpected error while undeploying service");
+    }
+
+    @Test
+    void rollingUpdate_shouldPerformRollingUpdate() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        InferenceService serviceSpec = new InferenceService();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+        Integer containerPort = 8080;
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT)))
+                .thenReturn(containerPort);
+        when(inferenceManifestGenerator.serviceConfig(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), any(), any(), any(), any(), any(), any(),
+                any(), any(), eq(containerPort), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+
+        // When
+        inferenceDeploymentManager.rollingUpdate(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        verify(k8sKserveClient).updateService(eq(NAMESPACE), eq(serviceSpec));
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.PENDING));
+        verify(deploymentRepository, never()).updateServiceName(any(), any());
+    }
+
+    @Test
+    void rollingUpdate_shouldNotUpdateWhenDeploymentNotRunning() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        // When
+        inferenceDeploymentManager.rollingUpdate(DEPLOYMENT_ID);
+
+        // Then
+        verify(k8sKserveClient, never()).updateService(anyString(), any());
+        verify(deploymentRepository, never()).updateStatus(any(), any());
+    }
+
+    @Test
+    void rollingUpdate_shouldHandleExceptionDuringUpdate() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        InferenceService serviceSpec = new InferenceService();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), eq(DEFAULT_KSERVE_SERVICE_PORT))).thenReturn(8080);
+        when(inferenceManifestGenerator.serviceConfig(
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), anyInt(), any(), any(), any())).thenReturn(serviceSpec);
+        doThrow(new RuntimeException("Test exception")).when(k8sKserveClient).updateService(eq(NAMESPACE), any());
+
+        // When
+        inferenceDeploymentManager.rollingUpdate(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        // This should throw the exception
+        var synchronizations = TransactionSynchronizationManager.getSynchronizations();
+        assertThatThrownBy(() -> {
+            for (TransactionSynchronization sync : synchronizations) {
+                sync.afterCommit();
+            }
+        })
+                .isInstanceOf(DeploymentException.class)
+                .hasMessageContaining("Rolling update failed during service update for deployment");
+    }
+
+    @Test
+    void reconcile_shouldSetUrlWhenModelStatusIndicatesReadyAndUrlIsPresent() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        InferenceService service = createInferenceServiceWithStatus(
+                SERVICE_NAME,
+                SERVICE_URL,
+                null,
+                true, // hasModelStatus
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE
+        );
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        // When
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isTrue();
+        verify(deploymentRepository).conditionalUpdateInNewTransaction(
+                eq(DEPLOYMENT_ID),
+                any(),
+                argThat(mutatorExpectingUrlAndRunning(SERVICE_URL)));
+    }
+
+    @Test
+    void reconcile_shouldSetUrlWhenModelStatusIndicatesReadyAndUrlIsPresentAndClusterInternalUrlIsSetToTrue() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        InferenceService service = createInferenceServiceWithStatus(
+                SERVICE_NAME,
+                null,
+                INTERNAL_SERVICE_URL,
+                true, // hasModelStatus
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE
+        );
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var kserveDeployProperties = new KserveDeployProperties();
+        kserveDeployProperties.setNamespace(NAMESPACE);
+        kserveDeployProperties.setStartupTimeout(STARTUP_TIMEOUT);
+        kserveDeployProperties.setUseClusterInternalUrl(true); // use internal url
+        var huggingFaceProperties = new HuggingFaceProperties();
+        inferenceDeploymentManager = new InferenceDeploymentManager(
+                k8sClient,
+                disposableResourceManager,
+                manifestGenerator,
+                inferenceManifestGenerator,
+                containerPortResolver,
+                ciliumNetworkPolicyCreator,
+                nodePoolProperties,
+                deploymentRepository,
+                k8sKserveClient,
+                kserveDeployProperties,
+                huggingFaceProperties,
+                inferenceTaskDetector,
+                textClassificationTransformerSection,
+                registryPullSecretProvisioner
+        );
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        // When
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isTrue();
+        verify(deploymentRepository).conditionalUpdateInNewTransaction(
+                eq(DEPLOYMENT_ID),
+                any(),
+                argThat(mutatorExpectingUrlAndRunning(INTERNAL_SERVICE_URL)));
+    }
+
+    @Test
+    void reconcile_shouldNotSetUrlWhenStatusIsNull() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.NOT_DEPLOYED);
+        InferenceService service = mock(InferenceService.class);
+        ObjectMeta metadata = new ObjectMeta();
+        metadata.setName(SERVICE_NAME);
+        when(service.getMetadata()).thenReturn(metadata);
+        when(service.getStatus()).thenReturn(null);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        // When
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        // Then
+        assertThat(result).isTrue();
+        // Status should remain PENDING (not RUNNING) because mapStatus returns PENDING when status is null
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.PENDING));
+    }
+
+    @Test
+    void reconcile_shouldNotSetUrlWhenModelStatusIsNull() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.CRASHED);
+        InferenceService service = createInferenceServiceWithStatus(
+                SERVICE_NAME,
+                SERVICE_URL,
+                null,
+                false, // no modelStatus
+                null,
+                null
+        );
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        // When
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        // Then
+        assertThat(result).isTrue();
+        // Status should remain PENDING (not RUNNING) because mapStatus returns PENDING when modelStatus is null
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.PENDING));
+    }
+
+    @Test
+    void reconcile_shouldSetNullUrlWhenModelStatusReadyButStatusUrlIsNull() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        InferenceService service = createInferenceServiceWithStatus(
+                SERVICE_NAME,
+                null, // null URL
+                null,
+                true, // hasModelStatus
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE
+        );
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        // When
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isTrue();
+        verify(deploymentRepository).conditionalUpdateInNewTransaction(
+                eq(DEPLOYMENT_ID),
+                any(),
+                argThat(mutatorExpectingUrlAndRunning(null)));
+    }
+
+    @Test
+    void reconcile_shouldSetEmptyUrlWhenModelStatusReadyButUrlIsEmpty() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        InferenceService service = createInferenceServiceWithStatus(
+                SERVICE_NAME,
+                "", // empty URL
+                null,
+                true, // hasModelStatus
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE
+        );
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        // When
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isTrue();
+        verify(deploymentRepository).conditionalUpdateInNewTransaction(
+                eq(DEPLOYMENT_ID),
+                any(),
+                argThat(mutatorExpectingUrlAndRunning("")));
+    }
+
+    @Test
+    void reconcile_shouldReturnStoppingStatusWhenServiceHasDeletionTimestamp() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        InferenceService service = mock(InferenceService.class);
+        ObjectMeta metadata = new ObjectMeta();
+        metadata.setName(SERVICE_NAME);
+        metadata.setDeletionTimestamp(Instant.now().toString());
+        when(service.getMetadata()).thenReturn(metadata);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        // When
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        // Then
+        assertThat(result).isTrue();
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.STOPPING));
+    }
+
+    @Test
+    void reconcile_shouldReportRunning_whenChainedAndTransformerUrlPresent() {
+        // Case A — chained deployment, predictor LOADED+UPTODATE, transformer surfaces a URL.
+        // mapStatus must return RUNNING; the readiness gate added in spec 022 must let the chained
+        // path through once the transformer URL is observable.
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        InferenceService service = createChainedInferenceServiceWithStatusAndTransformer(
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE,
+                SERVICE_URL,
+                SERVICE_URL,
+                null,
+                true);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        assertThat(result).isTrue();
+        verify(deploymentRepository).conditionalUpdateInNewTransaction(
+                eq(DEPLOYMENT_ID),
+                any(),
+                argThat(mutatorExpectingUrlAndRunning(SERVICE_URL)));
+    }
+
+    @Test
+    void reconcile_shouldDowngradeToPending_whenChainedAndTransformerComponentHasNoUrl() {
+        // Case B — chained, predictor LOADED+UPTODATE, transformer component present but neither
+        // .url nor .address.url populated. mapStatus must return PENDING (transformer not ready).
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        InferenceService service = createChainedInferenceServiceWithStatusAndTransformer(
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE,
+                SERVICE_URL,
+                null,
+                null,
+                true);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        assertThat(result).isTrue();
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.PENDING));
+        verify(deploymentRepository, never()).conditionalUpdateInNewTransaction(any(), any(), any());
+    }
+
+    @Test
+    void reconcile_shouldDowngradeToPending_whenChainedAndTransformerComponentMissing() {
+        // Case C — chained, predictor LOADED+UPTODATE, status.components has only "predictor".
+        // mapStatus must return PENDING — transformer entry absent ⇒ not ready.
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        InferenceService service = createChainedInferenceServiceWithStatusAndTransformer(
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE,
+                SERVICE_URL,
+                null,
+                null,
+                false);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+
+        assertThat(result).isTrue();
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.PENDING));
+        verify(deploymentRepository, never()).conditionalUpdateInNewTransaction(any(), any(), any());
+    }
+
+    @Test
+    void reconcile_shouldReportRunning_whenChainedAndTransformerOnlyHasAddressUrl() {
+        // Case D — chained, transformer surfaces address.url instead of the direct .url. The
+        // fallback branch in isTransformerReady must accept this as ready.
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        InferenceService service = createChainedInferenceServiceWithStatusAndTransformer(
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE,
+                SERVICE_URL,
+                null,
+                INTERNAL_SERVICE_URL,
+                true);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // resolveServiceUrl prefers transformer.url over address.url, and here transformer.url is
+        // null while predictor.url is set — so the deployment-level URL ends up being whatever
+        // resolveServiceUrl falls back to. The point of this case is that mapStatus reaches
+        // RUNNING via the address.url branch in isTransformerReady, not what URL gets stored.
+        assertThat(result).isTrue();
+        verify(deploymentRepository).conditionalUpdateInNewTransaction(eq(DEPLOYMENT_ID), any(), any());
+        verify(deploymentRepository, never()).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.PENDING));
+    }
+
+    @Test
+    void reconcile_shouldReportRunning_whenNonChainedAndPredictorLoadedUptodate() {
+        // Case E — regression guard. The chained-readiness branch added in spec 022 must not
+        // affect predictor-only deployments. A non-chained service with predictor LOADED+UPTODATE
+        // must still resolve to RUNNING regardless of whether status.components carries a
+        // "transformer" entry.
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        InferenceService service = createInferenceServiceWithStatus(
+                SERVICE_NAME,
+                SERVICE_URL,
+                null,
+                true,
+                States.ActiveModelState.LOADED,
+                ModelStatus.TransitionStatus.UPTODATE);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = getReconcileConfig(service);
+
+        boolean result = inferenceDeploymentManager.reconcile(reconcileConfig);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        assertThat(result).isTrue();
+        verify(deploymentRepository).conditionalUpdateInNewTransaction(
+                eq(DEPLOYMENT_ID),
+                any(),
+                argThat(mutatorExpectingUrlAndRunning(SERVICE_URL)));
+    }
+
+    private ArgumentMatcher<Consumer<Deployment>> mutatorExpectingUrlAndRunning(String expectedUrl) {
+        return mutator -> {
+            Deployment d = createDeployment(DeploymentStatus.PENDING);
+            mutator.accept(d);
+            return d.getStatus() == DeploymentStatus.RUNNING && Objects.equals(expectedUrl, d.getUrl());
+        };
+    }
+
+    private Deployment createDeployment(DeploymentStatus status) {
+        var deployment = new InferenceDeployment();
+        deployment.setId(DEPLOYMENT_ID);
+        deployment.setStatus(status);
+        deployment.setMetadata(new DeploymentMetadata());
+        deployment.setResources(new Resources(Collections.emptyMap(), Collections.emptyMap()));
+        deployment.setEnvs(List.of(
+                new SimpleEnvVar("TEST_ENV", new SimpleEnvVarValue("test-value"))));
+        deployment.setSource(new HuggingFaceSource("test-bucket/model"));
+        deployment.setArgs(List.of("--arg1", "value1"));
+        deployment.setAllowedDomains(List.of("test-domain-1", "test-domain-2"));
+        deployment.setServiceName(SERVICE_NAME);
+        return deployment;
+    }
+
+    private Pod createPod(String name, boolean ready) {
+        var pod = new Pod();
+        pod.setMetadata(new ObjectMeta());
+        pod.getMetadata().setName(name);
+        pod.getMetadata().setCreationTimestamp(Instant.now().toString());
+
+        var status = new PodStatus();
+        var containerStatus = new ContainerStatus();
+        containerStatus.setName(CONTAINER_NAME);
+
+        if (ready) {
+            containerStatus.setState(new ContainerStateBuilder().build()); // No waiting state means ready
+        } else {
+            containerStatus.setState(new ContainerStateBuilder().withNewWaiting().withReason("NotReady").endWaiting().build());
+        }
+
+        status.setContainerStatuses(List.of(containerStatus));
+        pod.setStatus(status);
+
+        var spec = new PodSpec();
+        var container = new Container();
+        container.setName(CONTAINER_NAME);
+        spec.setContainers(List.of(container));
+        pod.setSpec(spec);
+
+        return pod;
+    }
+
+    private Pod createPodWithRestartInfo(String name, int restartCount, String terminationReason, Integer exitCode, Integer signal) {
+        var pod = new Pod();
+        pod.setMetadata(new ObjectMeta());
+        pod.getMetadata().setName(name);
+        pod.getMetadata().setCreationTimestamp(Instant.now().toString());
+
+        var status = new PodStatus();
+        var containerStatus = new ContainerStatus();
+        containerStatus.setName(CONTAINER_NAME);
+        containerStatus.setRestartCount(restartCount);
+
+        // Set last terminated state
+        var terminatedState = new ContainerStateBuilder()
+                .withNewTerminated()
+                .withReason(terminationReason)
+                .withExitCode(exitCode)
+                .withSignal(signal)
+                .withFinishedAt(Instant.now().toString())
+                .endTerminated()
+                .build();
+        containerStatus.setLastState(terminatedState);
+
+        // Set current state as running
+        containerStatus.setState(new ContainerStateBuilder().build());
+
+        status.setContainerStatuses(List.of(containerStatus));
+        pod.setStatus(status);
+
+        var spec = new PodSpec();
+        var container = new Container();
+        container.setName(CONTAINER_NAME);
+        spec.setContainers(List.of(container));
+        pod.setSpec(spec);
+
+        return pod;
+    }
+
+    private Pod createPodWithMultipleContainers(String name, int restartCount1, int restartCount2) {
+        var pod = new Pod();
+        pod.setMetadata(new ObjectMeta());
+        pod.getMetadata().setName(name);
+        pod.getMetadata().setCreationTimestamp(Instant.now().toString());
+
+        var status = new PodStatus();
+
+        var containerStatus1 = new ContainerStatus();
+        containerStatus1.setName(CONTAINER_NAME);
+        containerStatus1.setRestartCount(restartCount1);
+        containerStatus1.setState(new ContainerStateBuilder().build());
+
+        var containerStatus2 = new ContainerStatus();
+        containerStatus2.setName("sidecar-container");
+        containerStatus2.setRestartCount(restartCount2);
+        containerStatus2.setState(new ContainerStateBuilder().build());
+
+        status.setContainerStatuses(List.of(containerStatus1, containerStatus2));
+        pod.setStatus(status);
+
+        var spec = new PodSpec();
+        var container1 = new Container();
+        container1.setName(CONTAINER_NAME);
+        var container2 = new Container();
+        container2.setName("sidecar-container");
+        spec.setContainers(List.of(container1, container2));
+        pod.setSpec(spec);
+
+        return pod;
+    }
+
+    private InferenceService createInferenceServiceWithStatus(
+            String serviceName,
+            String url,
+            String internalUrl,
+            boolean hasModelStatus,
+            States.ActiveModelState activeModelState,
+            ModelStatus.TransitionStatus transitionStatus
+    ) {
+        InferenceService service = mock(InferenceService.class);
+        ObjectMeta metadata = new ObjectMeta();
+        metadata.setName(serviceName);
+        when(service.getMetadata()).thenReturn(metadata);
+
+        if (hasModelStatus) {
+            InferenceServiceStatus status = mock(InferenceServiceStatus.class);
+
+            Components predicate = mock(Components.class);
+            when(status.getComponents()).thenReturn(Map.of("predictor", predicate));
+
+            if (url != null) {
+                when(predicate.getUrl()).thenReturn(url);
+            }
+
+            if (internalUrl != null) {
+                Address address = mock(Address.class);
+                when(address.getUrl()).thenReturn(internalUrl);
+                when(predicate.getAddress()).thenReturn(address);
+            }
+
+            ModelStatus modelStatus = mock(ModelStatus.class);
+            when(modelStatus.getTransitionStatus()).thenReturn(transitionStatus);
+
+            States states = mock(States.class);
+            when(states.getActiveModelState()).thenReturn(activeModelState);
+            when(modelStatus.getStates()).thenReturn(states);
+
+            when(status.getModelStatus()).thenReturn(modelStatus);
+            when(service.getStatus()).thenReturn(status);
+        } else {
+            InferenceServiceStatus status = mock(InferenceServiceStatus.class);
+            when(status.getModelStatus()).thenReturn(null);
+            when(service.getStatus()).thenReturn(status);
+        }
+
+        return service;
+    }
+
+    private ReconcileConfig<InferenceService> getReconcileConfig(InferenceService service) {
+        return ReconcileConfig.<InferenceService>builder()
+                .deploymentId(DEPLOYMENT_ID)
+                .service(service)
+                .serviceIsMissing(false)
+                .initiator("Reconciliation Test")
+                .ignorePendingOnServiceNotFound(false)
+                .build();
+    }
+
+    private static HuggingFaceProperties createHuggingFacePropertiesWithDefaultDomains() {
+        var props = new HuggingFaceProperties();
+        props.setDefaultAllowedDomains("huggingface.co,cdn.huggingface.co");
+        try {
+            Method init = HuggingFaceProperties.class.getDeclaredMethod("initDefaultAllowedDomains");
+            init.setAccessible(true);
+            init.invoke(props);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        return props;
+    }
+}

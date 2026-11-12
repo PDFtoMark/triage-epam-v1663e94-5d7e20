@@ -1,0 +1,34 @@
+{
+  "apiVersion": "serving.kserve.io/v1beta1",
+  "kind": "InferenceService",
+  "metadata": {
+    "annotations": {
+      "autoscaling.knative.dev/initial-scale": "1",
+      "serving.knative.dev/progress-deadline": "3630s"
+    },
+    "name": "dm-scale-zero-delay-app"
+  },
+  "spec": {
+    "predictor": {
+      "maxReplicas": 5,
+      "minReplicas": 1,
+      "model": {
+        "args": [
+          "--model_name",
+          "scale-zero-delay-app"
+        ],
+        "env": [],
+        "modelFormat": {
+          "name": "huggingface"
+        },
+        "resources": {
+          "limits": {},
+          "requests": {}
+        },
+        "storageUri": "s3://my-bucket/model"
+      },
+      "scaleMetric": "concurrency",
+      "scaleTarget": 10
+    }
+  }
+}

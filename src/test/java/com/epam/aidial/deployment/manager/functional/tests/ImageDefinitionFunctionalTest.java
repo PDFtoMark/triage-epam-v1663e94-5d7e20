@@ -1,0 +1,739 @@
+package com.epam.aidial.deployment.manager.functional.tests;
+
+import com.epam.aidial.deployment.manager.dao.repository.ImageDefinitionRepository;
+import com.epam.aidial.deployment.manager.functional.utils.FunctionalTestHelper;
+import com.epam.aidial.deployment.manager.model.DockerImageSource;
+import com.epam.aidial.deployment.manager.model.GenericRef;
+import com.epam.aidial.deployment.manager.model.GitDockerfileImageSource;
+import com.epam.aidial.deployment.manager.model.GitHubRef;
+import com.epam.aidial.deployment.manager.model.ImageDefinition;
+import com.epam.aidial.deployment.manager.model.ImageDefinitionViewElement;
+import com.epam.aidial.deployment.manager.model.ImageStatus;
+import com.epam.aidial.deployment.manager.model.ImageType;
+import com.epam.aidial.deployment.manager.model.McpImageDefinition;
+import com.epam.aidial.deployment.manager.model.McpRegistryRef;
+import com.epam.aidial.deployment.manager.model.deployment.CreateDeployment;
+import com.epam.aidial.deployment.manager.model.deployment.Deployment;
+import com.epam.aidial.deployment.manager.service.ImageDefinitionService;
+import com.epam.aidial.deployment.manager.service.deployment.DeploymentService;
+import com.epam.aidial.deployment.manager.service.security.SecurityClaimsExtractor;
+import io.fabric8.kubernetes.api.model.Secret;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.client.dsl.MixedOperation;
+import io.fabric8.kubernetes.client.dsl.Resource;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+public abstract class ImageDefinitionFunctionalTest {
+
+    @Autowired
+    private ImageDefinitionService service;
+    @Autowired
+    private ImageDefinitionRepository repository;
+    @Autowired
+    private DeploymentService deploymentService;
+    @Autowired
+    private KubernetesClient kubernetesClient;
+    @Autowired
+    private SecurityClaimsExtractor securityClaimsExtractor;
+
+    @BeforeEach
+    void setUp() {
+        Mockito.reset(securityClaimsExtractor);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateImageDefinition() {
+        // Given
+        ImageDefinition imageDef = FunctionalTestHelper.createMcpImageDefinition();
+
+        // When
+        service.createImageDefinition(imageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitions().stream().toList();
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(1);
+
+        ImageDefinition actualImageDef = imageDefs.getFirst();
+        imageDef.setId(actualImageDef.getId());
+        imageDef.setBuildStatus(ImageStatus.NOT_BUILT);
+        assertThat(actualImageDef).isEqualTo(imageDef);
+    }
+
+    @Test
+    public void shouldExtractAuthorIfWasNotProvided() {
+        // Given
+        var extractedAuthor = "extracted-author";
+        when(securityClaimsExtractor.getEmail()).thenReturn(extractedAuthor);
+        ImageDefinition imageDef = FunctionalTestHelper.createMcpImageDefinition();
+        imageDef.setAuthor(null);
+
+        // When
+        var createdImageDef = service.createImageDefinition(imageDef);
+
+        // Then
+        assertThat(createdImageDef.getAuthor()).isEqualTo(extractedAuthor);
+        verify(securityClaimsExtractor).getEmail();
+    }
+
+    @SuppressWarnings("unchecked")
+    @Test
+    public void shouldSuccessfullyCreateAndDeleteImageDefinition() {
+        // Given
+        var mixedOperation = Mockito.mock(MixedOperation.class);
+        var resource = Mockito.mock(Resource.class);
+        var secret = Mockito.mock(Secret.class);
+        when(mixedOperation.inNamespace(any())).thenReturn(mixedOperation);
+        when(mixedOperation.resource(any())).thenReturn(resource);
+        when(resource.create()).thenReturn(secret);
+        when(kubernetesClient.secrets()).thenReturn(mixedOperation);
+
+        ImageDefinition imageDef = FunctionalTestHelper.createInterceptorImageDefinition();
+
+        // When 1
+        service.createImageDefinition(imageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitions().stream().toList();
+
+        // Then 1
+        assertThat(imageDefs.size()).isEqualTo(1);
+        UUID imageDefId = imageDefs.getFirst().getId();
+
+        // When 2
+        service.completeBuildSuccessfully(imageDefId, "test-image", System.currentTimeMillis());
+        CreateDeployment createDeployment = FunctionalTestHelper.createInterceptorDeploymentRequest(imageDefId);
+        Deployment deployment = deploymentService.createDeployment(createDeployment);
+
+        service.deleteImageDefinitionSync(imageDefId);
+        imageDefs = service.getAllImageDefinitions().stream().toList();
+        boolean isImageDefPresent = service.getImageDefinition(imageDefId).isPresent();
+        boolean isDeploymentPresent = deploymentService.getDeployment(deployment.getId()).isPresent();
+
+        // Then 2
+        assertThat(imageDefs.isEmpty()).isTrue();
+        assertThat(isImageDefPresent).isFalse();
+        assertThat(isDeploymentPresent).isFalse();
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateAndUpdateImageDefinition() {
+        // Given
+        ImageDefinition imageDef = FunctionalTestHelper.createMcpImageDefinition();
+
+        // When 1
+        service.createImageDefinition(imageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitions().stream().toList();
+
+        // Then 1
+        assertThat(imageDefs.size()).isEqualTo(1);
+        imageDef = imageDefs.getFirst();
+
+        // When 2
+        imageDef.setName(imageDef.getName() + "1");
+        imageDef.setSource(new GitDockerfileImageSource("http://test-uri", "some-branch", "*", "", List.of("entry2"), null));
+        imageDef.setAuthor("updated-author");
+
+        service.updateImageDefinition(imageDef.getId(), imageDef);
+        imageDefs = service.getAllImageDefinitions().stream().toList();
+
+        // Then 2
+        assertThat(imageDefs.getFirst()).isEqualTo(imageDef);
+    }
+
+    @Test
+    public void shouldSetCreatedAndUpdatedAtOnCreate_AndOnlyUpdateUpdatedAtOnUpdate() throws InterruptedException {
+        // Given - Creation
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+
+        // When - Create
+        var createdImageDef = service.createImageDefinition(imageDef);
+
+        // Then - After Create
+        assertThat(createdImageDef.getCreatedAt()).isNotNull();
+        assertThat(createdImageDef.getUpdatedAt()).isNotNull();
+        assertThat(createdImageDef.getUpdatedAt()).isEqualTo(createdImageDef.getCreatedAt());
+        var creationTime = createdImageDef.getCreatedAt();
+
+        // Given - Update same entity at a later time
+        createdImageDef.setName(createdImageDef.getName() + "1");
+        createdImageDef.setSource(new GitDockerfileImageSource(
+                "http://test-uri", "some-branch", "*", "", List.of("entry2"), null
+        ));
+
+        // When - Update
+        Thread.sleep(1); // to be sure that created_at not equals to updated_at
+        var updatedImageDef = service.updateImageDefinition(createdImageDef.getId(), createdImageDef);
+
+        // Then - After Update
+        assertThat(updatedImageDef).as("Updated object should match input").isEqualTo(createdImageDef);
+        assertThat(updatedImageDef.getCreatedAt()).as("CreatedAt should not change").isEqualTo(creationTime);
+        assertThat(updatedImageDef.getUpdatedAt()).as("UpdatedAt should reflect new time").isNotEqualTo(creationTime);
+    }
+
+    @Test
+    public void shouldReturnCorrectTimestampsWhenFetchingAll() throws InterruptedException {
+        // Given - Creation
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+
+        // When - Create
+        service.createImageDefinition(imageDef);
+        var createdImageDefs = List.copyOf(service.getAllImageDefinitions());
+
+        // Then - After Create
+        assertThat(createdImageDefs.size()).isEqualTo(1);
+        var createdImageDef = createdImageDefs.getFirst();
+        assertThat(createdImageDef.getCreatedAt()).isNotNull();
+        assertThat(createdImageDef.getUpdatedAt()).isNotNull();
+        assertThat(createdImageDef.getUpdatedAt()).isEqualTo(createdImageDef.getCreatedAt());
+        var creationTime = createdImageDef.getCreatedAt();
+
+        // Given - Update
+        createdImageDef.setName(createdImageDef.getName() + "1");
+        createdImageDef.setSource(new GitDockerfileImageSource(
+                "http://test-uri", "some-branch", "*", "", List.of("entry2"), null
+        ));
+
+        // When - Update
+        Thread.sleep(1); // to be sure that created_at not equals to updated_at
+        service.updateImageDefinition(createdImageDef.getId(), createdImageDef);
+        var updatedImageDefs = List.copyOf(service.getAllImageDefinitions());
+
+        // Then - After Update
+        assertThat(updatedImageDefs.size()).isEqualTo(1);
+        var updatedImageDef = updatedImageDefs.getFirst();
+        assertThat(updatedImageDef).as("Fetched entity should match updated one").isEqualTo(createdImageDef);
+        assertThat(updatedImageDef.getCreatedAt()).as("CreatedAt should remain unchanged").isEqualTo(creationTime);
+        assertThat(updatedImageDef.getUpdatedAt()).as("UpdatedAt should be updated").isNotEqualTo(creationTime);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateAndGetImageDefinitionByType() {
+        // Given
+        ImageDefinition mcpImageDef = FunctionalTestHelper.createMcpImageDefinition();
+        ImageDefinition interceptorImageDef = FunctionalTestHelper.createInterceptorImageDefinition();
+
+        // When
+        service.createImageDefinition(mcpImageDef);
+        service.createImageDefinition(interceptorImageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitionsByType(ImageType.MCP).stream().toList();
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(1);
+
+        ImageDefinition actualImageDef = imageDefs.getFirst();
+        mcpImageDef.setId(actualImageDef.getId());
+        mcpImageDef.setBuildStatus(ImageStatus.NOT_BUILT);
+        assertThat(actualImageDef).isEqualTo(mcpImageDef);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateAndGetImageDefinitionsByNameAndType() {
+        // Given
+        ImageDefinition mcpImageDef = FunctionalTestHelper.createMcpImageDefinition();
+        ImageDefinition interceptorImageDef1 = FunctionalTestHelper.createInterceptorImageDefinition();
+        ImageDefinition interceptorImageDef2 = FunctionalTestHelper.createInterceptorImageDefinition();
+
+        String name = "test-interceptor-1";
+        interceptorImageDef1.setName(name);
+        interceptorImageDef1.setVersion("1.0.0");
+        interceptorImageDef2.setName(name);
+        interceptorImageDef2.setVersion("2.0.0");
+
+        // When
+        service.createImageDefinition(mcpImageDef);
+        service.createImageDefinition(interceptorImageDef1);
+        service.createImageDefinition(interceptorImageDef2);
+        var imageDefs = service.getAllImageDefinitionsByNameAndType(name, ImageType.INTERCEPTOR).stream()
+                .collect(Collectors.toMap(ImageDefinition::getVersion, def -> def));
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(2);
+
+        ImageDefinition actualImageDef = imageDefs.get(interceptorImageDef2.getVersion());
+        interceptorImageDef2.setId(actualImageDef.getId());
+        interceptorImageDef2.setBuildStatus(ImageStatus.NOT_BUILT);
+        assertThat(actualImageDef).isEqualTo(interceptorImageDef2);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateAndGetImageDefinitionsByName() {
+        // Given
+        ImageDefinition interceptorImageDef1 = FunctionalTestHelper.createInterceptorImageDefinition();
+        ImageDefinition interceptorImageDef2 = FunctionalTestHelper.createInterceptorImageDefinition();
+        ImageDefinition interceptorImageDef3 = FunctionalTestHelper.createInterceptorImageDefinition();
+
+        String name = "test-interceptor-1";
+        interceptorImageDef1.setName(name);
+        interceptorImageDef1.setVersion("1.0.0");
+        interceptorImageDef2.setName(name);
+        interceptorImageDef2.setVersion("2.0.0");
+        interceptorImageDef3.setName(name + "-0");
+
+        // When
+        service.createImageDefinition(interceptorImageDef1);
+        service.createImageDefinition(interceptorImageDef2);
+        service.createImageDefinition(interceptorImageDef3);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitionsByName(name).stream().toList();
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(2);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateMcpImageDefinitionWithMcp() {
+        // Given
+        McpImageDefinition imageDef = FunctionalTestHelper.createMcpImageDefinition();
+
+        // When
+        service.createImageDefinition(imageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitions().stream().toList();
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(1);
+
+        ImageDefinition actualImageDef = imageDefs.getFirst();
+        imageDef.setId(actualImageDef.getId());
+        imageDef.setBuildStatus(ImageStatus.NOT_BUILT);
+        assertThat(actualImageDef).isEqualTo(imageDef);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateAdapterImageDefinition() {
+        // Given
+        ImageDefinition imageDef = FunctionalTestHelper.createAdapterImageDefinition();
+
+        // When
+        service.createImageDefinition(imageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitions().stream().toList();
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(1);
+
+        ImageDefinition actualImageDef = imageDefs.getFirst();
+        imageDef.setId(actualImageDef.getId());
+        imageDef.setBuildStatus(ImageStatus.NOT_BUILT);
+        assertThat(actualImageDef).isEqualTo(imageDef);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateAndGetAdapterImageDefinitionByType() {
+        // Given
+        ImageDefinition adapterImageDef = FunctionalTestHelper.createAdapterImageDefinition();
+        ImageDefinition interceptorImageDef = FunctionalTestHelper.createInterceptorImageDefinition();
+
+        // When
+        service.createImageDefinition(adapterImageDef);
+        service.createImageDefinition(interceptorImageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitionsByType(ImageType.ADAPTER).stream().toList();
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(1);
+
+        ImageDefinition actualImageDef = imageDefs.getFirst();
+        adapterImageDef.setId(actualImageDef.getId());
+        adapterImageDef.setBuildStatus(ImageStatus.NOT_BUILT);
+        assertThat(actualImageDef).isEqualTo(adapterImageDef);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateAndGetAdapterImageDefinitionsByNameAndType() {
+        // Given
+        ImageDefinition adapterImageDef1 = FunctionalTestHelper.createAdapterImageDefinition();
+        ImageDefinition adapterImageDef2 = FunctionalTestHelper.createAdapterImageDefinition();
+        ImageDefinition interceptorImageDef = FunctionalTestHelper.createInterceptorImageDefinition();
+
+        String name = "test-adapter-1";
+        adapterImageDef1.setName(name);
+        adapterImageDef1.setVersion("1.0.0");
+        adapterImageDef2.setName(name);
+        adapterImageDef2.setVersion("2.0.0");
+
+        // When
+        service.createImageDefinition(interceptorImageDef);
+        service.createImageDefinition(adapterImageDef1);
+        service.createImageDefinition(adapterImageDef2);
+        var imageDefs = service.getAllImageDefinitionsByNameAndType(name, ImageType.ADAPTER).stream()
+                .collect(Collectors.toMap(ImageDefinition::getVersion, def -> def));
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(2);
+
+        ImageDefinition actualImageDef1 = imageDefs.get(adapterImageDef1.getVersion());
+        adapterImageDef1.setId(actualImageDef1.getId());
+        assertThat(actualImageDef1).isEqualTo(adapterImageDef1);
+
+        ImageDefinition actualImageDef2 = imageDefs.get(adapterImageDef2.getVersion());
+        adapterImageDef2.setId(actualImageDef2.getId());
+        assertThat(actualImageDef2).isEqualTo(adapterImageDef2);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateApplicationImageDefinition() {
+        // Given
+        ImageDefinition imageDef = FunctionalTestHelper.createApplicationImageDefinition();
+
+        // When
+        service.createImageDefinition(imageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitions().stream().toList();
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(1);
+
+        ImageDefinition actualImageDef = imageDefs.getFirst();
+        imageDef.setId(actualImageDef.getId());
+        imageDef.setBuildStatus(ImageStatus.NOT_BUILT);
+        assertThat(actualImageDef).isEqualTo(imageDef);
+    }
+
+    @Test
+    public void shouldSuccessfullyCreateAndGetApplicationImageDefinitionByType() {
+        // Given
+        ImageDefinition applicationImageDef = FunctionalTestHelper.createApplicationImageDefinition();
+        ImageDefinition interceptorImageDef = FunctionalTestHelper.createInterceptorImageDefinition();
+
+        // When
+        service.createImageDefinition(applicationImageDef);
+        service.createImageDefinition(interceptorImageDef);
+        List<ImageDefinition> imageDefs = service.getAllImageDefinitionsByType(ImageType.APPLICATION).stream().toList();
+
+        // Then
+        assertThat(imageDefs.size()).isEqualTo(1);
+
+        ImageDefinition actualImageDef = imageDefs.getFirst();
+        applicationImageDef.setId(actualImageDef.getId());
+        applicationImageDef.setBuildStatus(ImageStatus.NOT_BUILT);
+        assertThat(actualImageDef).isEqualTo(applicationImageDef);
+    }
+
+    @Test
+    public void shouldGetAdapterImageDefinitionViewsByType() {
+        // Given
+        var adapterImageDef1 = FunctionalTestHelper.createAdapterImageDefinition();
+        adapterImageDef1.setName("adapter-model");
+        adapterImageDef1.setVersion("1.0.0");
+
+        var adapterImageDef2 = FunctionalTestHelper.createAdapterImageDefinition();
+        adapterImageDef2.setName("adapter-model");
+        adapterImageDef2.setVersion("1.1.0");
+
+        var interceptorImageDef = FunctionalTestHelper.createInterceptorImageDefinition();
+        interceptorImageDef.setName("interceptor-model");
+        interceptorImageDef.setVersion("1.0.0");
+
+        // When
+        var createdAdapter1 = service.createImageDefinition(adapterImageDef1);
+        var createdAdapter2 = service.createImageDefinition(adapterImageDef2);
+        var createdInterceptor = service.createImageDefinition(interceptorImageDef);
+
+        service.completeBuildSuccessfully(createdAdapter1.getId(), "test-image", System.currentTimeMillis());
+
+        var adapterViews = service.getImageDefinitionViewsByType(ImageType.ADAPTER).stream().toList();
+        var interceptorViews = service.getImageDefinitionViewsByType(ImageType.INTERCEPTOR).stream().toList();
+
+        // Then
+        assertThat(adapterViews.size()).isEqualTo(1);
+        var adapterView = adapterViews.getFirst();
+        assertThat(adapterView.getName()).isEqualTo("adapter-model");
+        assertThat(adapterView.getAvailableVersions().size()).isEqualTo(2);
+        assertThat(adapterView.getSelectedId()).isEqualTo(createdAdapter1.getId());
+
+        assertThat(interceptorViews.size()).isEqualTo(1);
+        var interceptorView = interceptorViews.getFirst();
+        assertThat(interceptorView.getName()).isEqualTo("interceptor-model");
+        assertThat(interceptorView.getAvailableVersions().size()).isEqualTo(1);
+        assertThat(interceptorView.getSelectedId()).isEqualTo(createdInterceptor.getId());
+
+        List<UUID> adapterVersionIds = adapterViews.stream()
+                .flatMap(v -> v.getAvailableVersions().stream())
+                .map(ImageDefinitionViewElement::getId)
+                .toList();
+
+        assertThat(adapterVersionIds.contains(createdAdapter1.getId())).isTrue();
+        assertThat(adapterVersionIds.contains(createdAdapter2.getId())).isTrue();
+        assertThat(adapterVersionIds.contains(createdInterceptor.getId())).isFalse();
+    }
+
+    @Test
+    public void shouldSuccessfullyAddBuildLogsWithinLimit() {
+        // Given
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+
+        // When
+        var createdImageDef = service.createImageDefinition(imageDef);
+        var id = createdImageDef.getId();
+
+        service.addBuildLog(id, "Log 1");
+        service.addBuildLogs(id, List.of("Log 2", "Log 3"));
+        service.addBuildLog(id, "Log 4");
+
+        var imageDefWithLogs = service.getImageDefinition(id).orElseThrow();
+
+        // Then
+        var buildLogs = imageDefWithLogs.getBuildLogs();
+        assertThat(buildLogs.size()).isEqualTo(3); // limit is overriden in @TestPropertySource
+        assertThat(buildLogs.contains("Log 4")).isTrue();
+        assertThat(buildLogs.contains("Log 1")).isFalse();
+    }
+
+    @Test
+    public void shouldGetImageDefinitionViews() {
+        // Given
+        var imageDef0 = FunctionalTestHelper.createMcpImageDefinition();
+        imageDef0.setName("test-model");
+        imageDef0.setVersion("0.0.1");
+        imageDef0.setDescription("Version 0.0.1");
+
+        var imageDef1 = FunctionalTestHelper.createMcpImageDefinition();
+        imageDef1.setName("test-model");
+        imageDef1.setVersion("1.0.0");
+        imageDef1.setDescription("Version 1.0.0");
+
+        var imageDef2 = FunctionalTestHelper.createMcpImageDefinition();
+        imageDef2.setName("test-model");
+        imageDef2.setVersion("1.1.0");
+        imageDef2.setDescription("Version 1.1.0");
+
+        var imageDef3 = FunctionalTestHelper.createMcpImageDefinition();
+        imageDef3.setName("another-model");
+        imageDef3.setVersion("1.0.0");
+        imageDef3.setDescription("Another model 1");
+
+        var imageDef4 = FunctionalTestHelper.createMcpImageDefinition();
+        imageDef4.setName("another-model");
+        imageDef4.setVersion("2.0.0");
+        imageDef4.setDescription("Another model 2");
+
+        // When
+        var created0 = service.createImageDefinition(imageDef0);
+        var created1 = service.createImageDefinition(imageDef1);
+        var created4 = service.createImageDefinition(imageDef4);
+        service.createImageDefinition(imageDef2);
+        service.createImageDefinition(imageDef3);
+
+        service.completeBuildSuccessfully(created0.getId(), "test-image", System.currentTimeMillis());
+        service.completeBuildSuccessfully(created1.getId(), "test-image", System.currentTimeMillis());
+
+        // When
+        var views = service.getImageDefinitionViews().stream().toList();
+
+        // Then
+        assertThat(views.size()).isEqualTo(2);
+
+        var testModelView = views.stream()
+                .filter(v -> v.getName().equals("test-model"))
+                .findFirst()
+                .orElseThrow();
+
+        assertThat(testModelView.getSelectedId()).isEqualTo(created1.getId());
+        assertThat(testModelView.getAvailableVersions().size()).isEqualTo(3);
+
+        var anotherModelView = views.stream()
+                .filter(v -> v.getName().equals("another-model"))
+                .findFirst()
+                .orElseThrow();
+
+        assertThat(anotherModelView.getAvailableVersions().size()).isEqualTo(2);
+        assertThat(anotherModelView.getSelectedId()).isEqualTo(created4.getId());
+    }
+
+    @Test
+    public void shouldGetImageDefinitionViewsByType() {
+        // Given
+        var mcpImageDef1 = FunctionalTestHelper.createMcpImageDefinition();
+        mcpImageDef1.setName("mcp-model");
+        mcpImageDef1.setVersion("1.0.0");
+
+        var mcpImageDef2 = FunctionalTestHelper.createMcpImageDefinition();
+        mcpImageDef2.setName("mcp-model");
+        mcpImageDef2.setVersion("1.1.0");
+
+        var interceptorImageDef = FunctionalTestHelper.createInterceptorImageDefinition();
+        interceptorImageDef.setName("interceptor-model");
+        interceptorImageDef.setVersion("1.0.0");
+
+        // When
+        var createdMcp1 = service.createImageDefinition(mcpImageDef1);
+        var createdMcp2 = service.createImageDefinition(mcpImageDef2);
+        var createdInterceptor = service.createImageDefinition(interceptorImageDef);
+
+        service.completeBuildSuccessfully(createdMcp1.getId(), "test-image", System.currentTimeMillis());
+
+        // When
+        var mcpViews = service.getImageDefinitionViewsByType(ImageType.MCP).stream().toList();
+        var interceptorViews = service.getImageDefinitionViewsByType(ImageType.INTERCEPTOR).stream().toList();
+
+        // Then
+        assertThat(mcpViews.size()).isEqualTo(1);
+        var mcpView = mcpViews.getFirst();
+        assertThat(mcpView.getName()).isEqualTo("mcp-model");
+        assertThat(mcpView.getAvailableVersions().size()).isEqualTo(2);
+        assertThat(mcpView.getSelectedId()).isEqualTo(createdMcp1.getId());
+
+        assertThat(interceptorViews.size()).isEqualTo(1);
+        var interceptorView = interceptorViews.getFirst();
+        assertThat(interceptorView.getName()).isEqualTo("interceptor-model");
+        assertThat(interceptorView.getAvailableVersions().size()).isEqualTo(1);
+        assertThat(interceptorView.getSelectedId()).isEqualTo(createdInterceptor.getId());
+
+        List<UUID> mcpVersionIds = mcpViews.stream()
+                .flatMap(v -> v.getAvailableVersions().stream())
+                .map(ImageDefinitionViewElement::getId)
+                .toList();
+
+        assertThat(mcpVersionIds.contains(createdMcp1.getId())).isTrue();
+        assertThat(mcpVersionIds.contains(createdMcp2.getId())).isTrue();
+        assertThat(mcpVersionIds.contains(createdInterceptor.getId())).isFalse();
+    }
+
+    @Test
+    public void shouldCreateImageDefinitionWithMcpRegistryRef() {
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+        var source = new GitDockerfileImageSource("http://test-uri", "main", null, null, List.of("entry"), null);
+        source.setExternalRegistryRef(new McpRegistryRef("my-server", "1.0.0"));
+        imageDef.setSource(source);
+
+        var created = service.createImageDefinition(imageDef);
+        var fetched = service.getImageDefinition(created.getId()).orElseThrow();
+
+        assertThat(fetched.getSource()).isInstanceOf(GitDockerfileImageSource.class);
+        var fetchedSource = (GitDockerfileImageSource) fetched.getSource();
+        assertThat(fetchedSource.getExternalRegistryRef()).isInstanceOf(McpRegistryRef.class);
+        var ref = (McpRegistryRef) fetchedSource.getExternalRegistryRef();
+        assertThat(ref.packageName()).isEqualTo("my-server");
+        assertThat(ref.version()).isEqualTo("1.0.0");
+    }
+
+    @Test
+    public void shouldUpdateImageDefinitionMcpRegistryRefVersion() {
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+        var source = new DockerImageSource("http://test-uri", List.of("entry1"), new McpRegistryRef("my-server", "1.0.0"));
+        imageDef.setSource(source);
+
+        var created = service.createImageDefinition(imageDef);
+
+        created.setSource(new DockerImageSource("http://test-uri", List.of("entry1"), new McpRegistryRef("my-server", "2.0.0")));
+        service.updateImageDefinition(created.getId(), created);
+
+        var fetched = service.getImageDefinition(created.getId()).orElseThrow();
+        var ref = (McpRegistryRef) ((DockerImageSource) fetched.getSource()).getExternalRegistryRef();
+        assertThat(ref.packageName()).isEqualTo("my-server");
+        assertThat(ref.version()).isEqualTo("2.0.0");
+    }
+
+    @Test
+    public void shouldCreateImageDefinitionWithGitHubRef() {
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+        var source = new DockerImageSource("http://test-uri", List.of("entry1"), new GitHubRef("org/repo"));
+        imageDef.setSource(source);
+
+        var created = service.createImageDefinition(imageDef);
+        var fetched = service.getImageDefinition(created.getId()).orElseThrow();
+
+        assertThat(fetched.getSource()).isInstanceOf(DockerImageSource.class);
+        var fetchedSource = (DockerImageSource) fetched.getSource();
+        assertThat(fetchedSource.getExternalRegistryRef()).isInstanceOf(GitHubRef.class);
+        assertThat(((GitHubRef) fetchedSource.getExternalRegistryRef()).repo()).isEqualTo("org/repo");
+    }
+
+    @Test
+    public void shouldCreateImageDefinitionWithGenericRef() {
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+        var source = new DockerImageSource("http://test-uri", List.of("entry1"), new GenericRef("https://example.com/pkg"));
+        imageDef.setSource(source);
+
+        var created = service.createImageDefinition(imageDef);
+        var fetched = service.getImageDefinition(created.getId()).orElseThrow();
+
+        assertThat(fetched.getSource()).isInstanceOf(DockerImageSource.class);
+        var fetchedSource = (DockerImageSource) fetched.getSource();
+        assertThat(fetchedSource.getExternalRegistryRef()).isInstanceOf(GenericRef.class);
+        assertThat(((GenericRef) fetchedSource.getExternalRegistryRef()).url()).isEqualTo("https://example.com/pkg");
+    }
+
+    @Test
+    public void shouldCreateImageDefinitionWithoutExternalRef() {
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+
+        var created = service.createImageDefinition(imageDef);
+        var fetched = service.getImageDefinition(created.getId()).orElseThrow();
+
+        assertThat(fetched.getSource()).isInstanceOf(DockerImageSource.class);
+        var fetchedSource = (DockerImageSource) fetched.getSource();
+        assertThat(fetchedSource.getExternalRegistryRef()).isNull();
+    }
+
+    @Test
+    public void shouldUpdateImageDefinitionExternalRef() {
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+        var source = new DockerImageSource("http://test-uri", List.of("entry1"), new McpRegistryRef("old-pkg", "1.0.0"));
+        imageDef.setSource(source);
+
+        var created = service.createImageDefinition(imageDef);
+
+        created.setSource(new DockerImageSource("http://test-uri", List.of("entry1"), new GitHubRef("new/repo")));
+        service.updateImageDefinition(created.getId(), created);
+
+        var fetched = service.getImageDefinition(created.getId()).orElseThrow();
+        var fetchedSource = (DockerImageSource) fetched.getSource();
+        assertThat(fetchedSource.getExternalRegistryRef()).isInstanceOf(GitHubRef.class);
+        assertThat(((GitHubRef) fetchedSource.getExternalRegistryRef()).repo()).isEqualTo("new/repo");
+    }
+
+    @Test
+    public void shouldClearImageDefinitionExternalRef() {
+        var imageDef = FunctionalTestHelper.createMcpImageDefinition();
+        var source = new DockerImageSource("http://test-uri", List.of("entry1"), new McpRegistryRef("my-pkg", "1.0.0"));
+        imageDef.setSource(source);
+
+        var created = service.createImageDefinition(imageDef);
+
+        created.setSource(new DockerImageSource("http://test-uri", List.of("entry1"), null));
+        service.updateImageDefinition(created.getId(), created);
+
+        var fetched = service.getImageDefinition(created.getId()).orElseThrow();
+        var fetchedSource = (DockerImageSource) fetched.getSource();
+        assertThat(fetchedSource.getExternalRegistryRef()).isNull();
+    }
+
+    @Test
+    public void shouldListImageDefinitions_withMixedExternalRefs() {
+        var imgDef1 = FunctionalTestHelper.createMcpImageDefinition();
+        imgDef1.setName("img-with-mcp-ref");
+        imgDef1.setSource(new DockerImageSource("http://test-1", List.of("e"), new McpRegistryRef("pkg-1", "1.0.0")));
+
+        var imgDef2 = FunctionalTestHelper.createInterceptorImageDefinition();
+        imgDef2.setName("img-with-generic-ref");
+        imgDef2.setSource(new DockerImageSource("http://test-2", List.of("e"), new GenericRef("https://example.com")));
+
+        var imgDef3 = FunctionalTestHelper.createAdapterImageDefinition();
+        imgDef3.setName("img-no-ref");
+        imgDef3.setSource(new DockerImageSource("http://test-3", List.of("e"), null));
+
+        service.createImageDefinition(imgDef1);
+        service.createImageDefinition(imgDef2);
+        service.createImageDefinition(imgDef3);
+
+        var allDefs = service.getAllImageDefinitions().stream().toList();
+        assertThat(allDefs.size()).isEqualTo(3);
+
+        for (var def : allDefs) {
+            var src = (DockerImageSource) def.getSource();
+            switch (def.getName()) {
+                case "img-with-mcp-ref" -> assertThat(src.getExternalRegistryRef()).isInstanceOf(McpRegistryRef.class);
+                case "img-with-generic-ref" -> assertThat(src.getExternalRegistryRef()).isInstanceOf(GenericRef.class);
+                case "img-no-ref" -> assertThat(src.getExternalRegistryRef()).isNull();
+                default -> org.assertj.core.api.Assertions.fail("Unexpected image definition: " + def.getName());
+            }
+        }
+    }
+}

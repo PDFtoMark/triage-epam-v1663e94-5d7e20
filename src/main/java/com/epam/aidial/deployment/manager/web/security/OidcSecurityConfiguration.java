@@ -1,0 +1,159 @@
+package com.epam.aidial.deployment.manager.web.security;
+
+import com.epam.aidial.deployment.manager.utils.SecretUtils;
+import com.epam.aidial.deployment.manager.web.security.apikey.ApiKeyAuthenticationFilter;
+import com.nimbusds.jwt.SignedJWT;
+import jakarta.servlet.http.HttpServletRequest;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.AuthenticationManagerResolver;
+import org.springframework.security.authentication.ProviderManager;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.oauth2.jwt.JwtDecoder;
+import org.springframework.security.oauth2.jwt.NimbusJwtDecoder;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationProvider;
+import org.springframework.security.oauth2.server.resource.authentication.OpaqueTokenAuthenticationProvider;
+import org.springframework.security.oauth2.server.resource.introspection.OpaqueTokenIntrospector;
+import org.springframework.security.oauth2.server.resource.web.BearerTokenResolver;
+import org.springframework.security.oauth2.server.resource.web.DefaultBearerTokenResolver;
+import org.springframework.security.oauth2.server.resource.web.authentication.BearerTokenAuthenticationFilter;
+import org.springframework.security.web.SecurityFilterChain;
+
+import java.text.ParseException;
+
+@Slf4j
+@Configuration(proxyBeanMethods = false)
+@EnableWebSecurity
+@EnableMethodSecurity(securedEnabled = true, jsr250Enabled = true)
+@ConditionalOnProperty(value = "config.rest.security.mode", havingValue = "oidc", matchIfMissing = true)
+@RequiredArgsConstructor
+public class OidcSecurityConfiguration {
+
+    private final IdentityProvidersProperties identityProvidersProperties;
+    private final IdentityProviderUtils identityProviderUtils;
+    private final PublicPathsResolver publicPathsResolver;
+
+    @Bean
+    public JwtAuthenticationConverterFactory jwtAuthenticationConverterFactory() {
+        return new JwtAuthenticationConverterFactory(
+                identityProvidersProperties.getJwtProviders(),
+                identityProviderUtils
+        );
+    }
+
+    @Bean
+    public OpaqueAuthenticationConverterFactory opaqueAuthenticationConverterFactory() {
+        return new OpaqueAuthenticationConverterFactory(
+                identityProvidersProperties.getOpaqueTokenProviders(),
+                identityProviderUtils
+        );
+    }
+
+    @Bean
+    public NimbusJwtDecoderResolver nimbusJwtDecoderResolver() {
+        return config -> NimbusJwtDecoder.withJwkSetUri(config.getJwkSetUri()).build();
+    }
+
+    @Bean
+    public IssuerToDecoderMapFactory issuerToDecoderMapFactory(NimbusJwtDecoderResolver nimbusJwtDecoderResolver) {
+        return new IssuerToDecoderMapFactory(identityProviderUtils, nimbusJwtDecoderResolver);
+    }
+
+    @Bean
+    public TokenDecoderFactory tokenDecoderFactory(IssuerToDecoderMapFactory issuerToDecoderMapFactory) {
+        return new TokenDecoderFactoryImpl(identityProvidersProperties.getJwtProviders(), issuerToDecoderMapFactory);
+    }
+
+    @Bean
+    public TokenIntrospectorFactory tokenIntrospectorFactory() {
+        return new TokenIntrospectorFactoryImpl(identityProviderUtils, identityProvidersProperties.getOpaqueTokenProviders());
+    }
+
+    @Bean
+    @ConditionalOnBean(ApiKeyAuthenticationFilter.class)
+    public FilterRegistrationBean<ApiKeyAuthenticationFilter> apiKeyFilterRegistration(ApiKeyAuthenticationFilter filter) {
+        // Suppress Spring Boot's auto-registration: the filter is wired into the Spring Security chain
+        // via addFilterBefore() in securityFilterChain(), not as a top-level servlet filter.
+        FilterRegistrationBean<ApiKeyAuthenticationFilter> registration = new FilterRegistrationBean<>(filter);
+        registration.setEnabled(false);
+        return registration;
+    }
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http,
+                                                   AuthenticationManagerResolver<HttpServletRequest> authenticationManagerResolver,
+                                                   ObjectProvider<ApiKeyAuthenticationFilter> apiKeyFilter) throws Exception {
+        http.csrf(AbstractHttpConfigurer::disable)
+                .authorizeHttpRequests(authorize -> authorize
+                        .requestMatchers(publicPathsResolver.resolvePublicPathPatterns()).permitAll()
+                        .requestMatchers("/api/v1/**").authenticated()
+                        .anyRequest().denyAll())
+                .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                .oauth2ResourceServer(oauth2ResourceServer -> oauth2ResourceServer
+                        .authenticationManagerResolver(authenticationManagerResolver));
+        apiKeyFilter.ifAvailable(filter -> http.addFilterBefore(filter, BearerTokenAuthenticationFilter.class));
+        return http.build();
+    }
+
+    @Bean
+    public AuthenticationManagerResolver<HttpServletRequest> authenticationManagerResolver(JwtAuthenticationProvider jwtAuthenticationProvider,
+                                                                                           OpaqueTokenAuthenticationProvider opaqueTokenAuthenticationProvider) {
+        BearerTokenResolver tokenResolver = new DefaultBearerTokenResolver();
+
+        AuthenticationManager jwtAuth = new ProviderManager(jwtAuthenticationProvider);
+        AuthenticationManager opaqueAuth = new ProviderManager(opaqueTokenAuthenticationProvider);
+
+        return request -> {
+            String token = tokenResolver.resolve(request);
+            try {
+                if (log.isTraceEnabled()) {
+                    log.trace("authManagerResolve. token: {}", token);
+                } else if (log.isDebugEnabled()) {
+                    log.debug("authManagerResolve. token: {}", SecretUtils.mask(token));
+                }
+                SignedJWT.parse(token);
+                return jwtAuth;
+            } catch (ParseException e) {
+                log.debug("Failed to parse JWT token: {}. Falling back to opaque token auth", SecretUtils.mask(token));
+                return opaqueAuth;
+            }
+        };
+    }
+
+    @Bean
+    public JwtAuthenticationProvider jwtAuthenticationProvider(TokenDecoderFactory tokenDecoderFactory,
+                                                               JwtAuthenticationConverterFactory jwtAuthenticationConverterFactory) {
+        JwtDecoder jwtDecoder = tokenDecoderFactory.createJwtDecoder();
+        JwtAuthenticationProvider jwtAuthenticationProvider = new JwtAuthenticationProvider(jwtDecoder);
+        jwtAuthenticationProvider.setJwtAuthenticationConverter(token -> {
+            String issuer = token.getIssuer().toString();
+            var converter = jwtAuthenticationConverterFactory.getConverter(issuer);
+            return converter.convert(token);
+        });
+        return jwtAuthenticationProvider;
+    }
+
+    @Bean
+    public OpaqueTokenAuthenticationProvider opaqueTokenAuthenticationProvider(TokenIntrospectorFactory tokenIntrospectorFactory,
+                                                                               OpaqueAuthenticationConverterFactory opaqueAuthenticationConverterFactory) {
+        OpaqueTokenIntrospector opaqueTokenIntrospector = tokenIntrospectorFactory.createOpaqueTokenIntrospector();
+        OpaqueTokenAuthenticationProvider opaqueTokenAuthenticationProvider = new OpaqueTokenAuthenticationProvider(opaqueTokenIntrospector);
+        opaqueTokenAuthenticationProvider.setAuthenticationConverter((introspectedToken, authenticatedPrincipal) -> {
+            var providerName = (String) authenticatedPrincipal.getAttribute(OpaqueTokenProviderConfig.IDP_CLAIM);
+            var converter = opaqueAuthenticationConverterFactory.getConverter(providerName);
+            return converter.convert(introspectedToken, authenticatedPrincipal);
+        });
+        return opaqueTokenAuthenticationProvider;
+    }
+}

@@ -1,0 +1,503 @@
+spring:
+  application:
+    name: deployment-manager
+  logging:
+    level:
+      org.springframework.security: ${SPRING_SECURITY_LOG_LEVEL:INFO}
+      com.epam.aidial.deployment.manager: ${APP_LOG_LEVEL:INFO}
+      org.hibernate.SQL: ${HIBERNATE_SQL_LOG_LEVEL:INFO}
+      org.hibernate.type.descriptor.sql.BasicBinder: ${HIBERNATE_BINDER_LOG_LEVEL:INFO}
+  jpa:
+    properties:
+      hibernate:
+        boot:
+          allow_jdbc_metadata_access: true
+      org:
+        hibernate:
+          envers:
+            store_data_at_delete: true
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    open-in-view: false
+  flyway:
+    enabled: true
+    locations: classpath:db/migration/${datasource.vendor}/
+    baseline-on-migrate: true
+    baseline-version: 1.1
+  mvc:
+    async:
+      request-timeout: 600000 # 10 min
+
+app:
+  huggingface:
+    base-url: ${HUGGINGFACE_BASE_URL:https://huggingface.co}
+    api-token: ${HUGGINGFACE_API_TOKEN:}
+    tag-cache-duration: ${HUGGINGFACE_TAG_CACHE_DURATION:24h}
+    default-allowed-domains: ${HUGGINGFACE_DEFAULT_ALLOWED_DOMAINS:huggingface.co,transfer.xethub.hf.co,cas-server.xethub.hf.co}
+
+  mcp-registry:
+    base-url: ${MCP_REGISTRY_BASE_URL:https://registry.modelcontextprotocol.io}
+    max-pages-to-scan: ${MCP_REGISTRY_MAX_PAGES_TO_SCAN:25}
+
+  kubernetes:
+    connect-type: ${K8S_CONNECT_TYPE:CONFIG_FILE}
+    config_file:
+      kube-config: ${user.home}/.kube/config
+      contexts:
+        deploy-context: ${K8S_DEPLOY_CONTEXT:}
+    token:
+      master-url: ${K8S_MASTER_URL:}
+      oauth-token: ${K8S_OAUTH_TOKEN:}
+
+  registry:
+    url: ${DOCKER_REGISTRY:test-docker-registry}
+    protocol: ${DOCKER_REGISTRY_PROTOCOL:https}
+    auth: ${DOCKER_REGISTRY_AUTH:NONE}
+    user: ${DOCKER_REGISTRY_USER:}
+    password: ${DOCKER_REGISTRY_PASSWORD:}
+    trusted-private-registries: ${TRUSTED_PRIVATE_REGISTRIES:}
+    auto-pull-secret-enabled: ${AUTO_PULL_SECRET_ENABLED:true}
+
+  git:
+    trusted-private-repos: ${TRUSTED_PRIVATE_GIT_REPOS:}
+
+  pipeline:
+    log-reader:
+      max-log-count: ${PIPELINE_RUNNER_MAX_LOG_COUNT:10000}
+      max-log-length: ${PIPELINE_RUNNER_MAX_LOG_LENGTH:10000}
+
+  sse:
+    heartbeat:
+      interval: 10000
+
+  build:
+    secrets:
+      git:
+        credentials-file: .git-credentials
+        config-file: .gitconfig
+        ssh-key-file: id_rsa
+        ssh-known-hosts-file: known_hosts
+        secret-volume-name: git-secret-volume
+        root-home-dir: /root
+    mcp-proxy:
+      images:
+        alpine: ${MCP_PROXY_EXECUTABLE_IMAGE_ALPINE:ghcr.io/epam/ai-dial-deployment-manager-mcp-proxy:0.1.0-alpine}
+        debian: ${MCP_PROXY_EXECUTABLE_IMAGE_DEBIAN:ghcr.io/epam/ai-dial-deployment-manager-mcp-proxy:0.1.0-debian}
+  build-namespace: ${K8S_BUILD_NAMESPACE:default}
+  git-clone-image: ${GIT_CLONE_IMAGE:alpine/git:2.52.0}
+  builder-root-image: moby/buildkit:v0.27.1
+  builder-rootless-image: moby/buildkit:v0.27.1-rootless
+  analyser-image: anchore/syft:v1.40.0
+  copy-image: quay.io/skopeo/stable:v1.21.0
+  docker-config-path: /kaniko/.docker/config.json
+  knative:
+    enabled: ${K8S_KNATIVE_ENABLED:true}
+    deploy:
+      namespace: ${K8S_KNATIVE_DEPLOYMENT_NAMESPACE:default}
+      startup-timeout: ${K8S_KNATIVE_DEPLOYMENT_STARTUP_TIMEOUT_SEC:60}
+      undeploy-timeout: ${K8S_KNATIVE_DEPLOYMENT_UNDEPLOY_TIMEOUT_SEC:300}
+      informer-resync-interval: ${K8S_KNATIVE_DEPLOYMENT_INFORMER_RESYNC_INTERVAL_SEC:600}
+      ready-grace-period: ${K8S_KNATIVE_DEPLOYMENT_READY_GRACE_PERIOD_SEC:15}
+  kserve:
+    enabled: ${K8S_KSERVE_ENABLED:false}
+    deploy:
+      namespace: ${K8S_KSERVE_DEPLOYMENT_NAMESPACE:default}
+      startup-timeout: ${K8S_KSERVE_DEPLOYMENT_STARTUP_TIMEOUT_SEC:3600}
+      informer-resync-interval: ${K8S_KSERVE_DEPLOYMENT_INFORMER_RESYNC_INTERVAL_SEC:600}
+      use-cluster-internal-url: ${K8S_KSERVE_DEPLOYMENT_USE_CLUSTER_INTERNAL_URL:true}
+  metrics:
+    scrape:
+      enabled: ${METRICS_SCRAPE_ENABLED:true}
+      timeout-ms: ${METRICS_SCRAPE_TIMEOUT_MS:10000}
+      cache-ttl-ms: ${METRICS_SCRAPE_CACHE_TTL_MS:5000}
+      resource-usage:
+        enabled: ${METRICS_SCRAPE_RESOURCE_USAGE_ENABLED:true}
+      gpu:
+        enabled: ${METRICS_SCRAPE_GPU_ENABLED:true}
+        namespace: ${METRICS_SCRAPE_GPU_DCGM_NAMESPACE:gpu-operator}
+        pod-label-selector: ${METRICS_SCRAPE_GPU_DCGM_POD_SELECTOR:app=nvidia-dcgm-exporter}
+        port: ${METRICS_SCRAPE_GPU_DCGM_PORT:9400}
+        metrics-path: ${METRICS_SCRAPE_GPU_DCGM_METRICS_PATH:/metrics}
+        pod-label: ${METRICS_SCRAPE_GPU_DCGM_POD_LABEL:pod}
+        namespace-label: ${METRICS_SCRAPE_GPU_DCGM_NAMESPACE_LABEL:namespace}
+  image-name-format: ${IMAGE_NAME_FORMAT:app-%s}
+  image-label: latest
+  image-build-timeout-sec: 300
+  image-build-stop-timeout-sec: 45
+  image-build-logs-size-limit: 1000
+  heartbeat-period-sec: 30
+  max-error-log-lines: 20
+  max-error-log-chars: 1000
+  secrets-volume-mount-path: ${SECRETS_VOLUME_MOUNT_PATH:/etc/secrets}
+  resource-cleaner-cron: ${RESOURCE_CLEANER_CRON:0 0 5 * * *}
+  resource-cleaner-take-size: ${RESOURCE_CLEANER_TAKE_SIZE:100}
+  resource-cleaner-scheduler-lock-at-most-for: ${RESOURCE_CLEANER_SCHEDULER_LOCK_AT_MOST_FOR:10m}
+  component-cleaner-cron: ${COMPONENT_CLEANER_CRON:0 0 5 * * *}
+  component-cleaner-scheduler-lock-at-most-for: ${COMPONENT_CLEANER_SCHEDULER_LOCK_AT_MOST_FOR:10m}
+  cilium-network-policies-enabled: ${CILIUM_NETWORK_POLICIES_ENABLED:false}
+  resource-name-prefix: ${RESOURCE_NAME_PREFIX:}
+  config:
+    export:
+      file-name: ${CONFIG_EXPORT_FILE_NAME:dm-config.json}
+      zip-name: ${CONFIG_EXPORT_ZIP_NAME:deployment-manager-config.zip}
+  validation:
+    resources:
+      max-cpu-in-cores: ${RESOURCES_MAX_CPU_IN_CORES:10}
+      max-memory-in-mb: ${RESOURCES_MAX_MEMORY_IN_MB:100000}
+      max-nvidia-gpu: ${RESOURCES_MAX_NVIDIA_GPU:5}
+  node-pools:
+    pools: ${NODE_POOLS:}
+    default: ${NODE_POOL_DEFAULT:}
+    default-model: ${NODE_POOL_DEFAULT_MODEL:}
+  deployment:
+    healthcheck-enabled: ${DEPLOYMENT_HEALTHCHECK_ENABLED:true}
+    reserved-env-names: ${DEPLOYMENT_RESERVED_ENV_NAMES:PORT,K_SERVICE,K_CONFIGURATION,K_REVISION}
+    progress-deadline:
+      default-initial-delay: ${DEPLOYMENT_PROGRESS_DEADLINE_DEFAULT_INITIAL_DELAY:0}
+      default-period: ${DEPLOYMENT_PROGRESS_DEADLINE_DEFAULT_PERIOD:10}
+      default-failure-threshold: ${DEPLOYMENT_PROGRESS_DEADLINE_DEFAULT_FAILURE_THRESHOLD:3}
+      buffer-seconds: ${DEPLOYMENT_PROGRESS_DEADLINE_BUFFER_SECONDS:30}
+    reconcile:
+      background:
+        cron: ${DEPLOYMENT_RECONCILE_BACKGROUND_CRON:0 */15 * * * *}
+        lock-at-most: ${DEPLOYMENT_RECONCILE_BACKGROUND_LOCK_AT_MOST:5m}
+        stale-threshold: ${DEPLOYMENT_RECONCILE_BACKGROUND_STALE_THRESHOLD_MINS:10}
+      startup:
+        enabled: ${DEPLOYMENT_RECONCILE_ON_STARTUP_ENABLED:true}
+        batch-size: ${DEPLOYMENT_RECONCILE_ON_STARTUP_BATCH_SIZE:50}
+        concurrency: ${DEPLOYMENT_RECONCILE_ON_STARTUP_CONCURRENCY:2}
+      executor:
+        thread-pool-size: ${DEPLOYMENT_RECONCILE_EXECUTOR_THREAD_POOL_SIZE:5}
+        queue-capacity: ${DEPLOYMENT_RECONCILE_EXECUTOR_QUEUE_CAPACITY:100}
+        thread-name-prefix: ${DEPLOYMENT_RECONCILE_EXECUTOR_THREAD_NAME_PREFIX:k8s-reconciliation-pool}
+  knative-service-config:
+    apiVersion: serving.knative.dev/v1
+    kind: Service
+    spec:
+      template:
+        metadata:
+          annotations:
+            "[autoscaling.knative.dev/initial-scale]": ${KNATIVE_SERVICE_DEFAULT_INITIAL_SCALE:1}
+            "[autoscaling.knative.dev/min-scale]": ${KNATIVE_SERVICE_DEFAULT_MIN_SCALE:0}
+            "[autoscaling.knative.dev/max-scale]": ${KNATIVE_SERVICE_DEFAULT_MAX_SCALE:1}
+            "[autoscaling.knative.dev/window]": ${KNATIVE_SERVICE_DEFAULT_WINDOW:300s}
+        spec:
+          idleTimeoutSeconds: 300
+          containerConcurrency: 50
+          automountServiceAccountToken: false
+  knative-service-container-config:
+    name: app-container
+    imagePullPolicy: Always
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "250M"
+        ephemeral-storage: "500M"
+      limits:
+        cpu: "1000m"
+        memory: "4G"
+        ephemeral-storage: "1G"
+  inference-service-config:
+    apiVersion: "serving.kserve.io/v1beta1"
+    kind: InferenceService
+    metadata:
+      annotations:
+        "[autoscaling.knative.dev/initial-scale]": ${KSERVE_SERVICE_DEFAULT_INITIAL_SCALE:1}
+    spec:
+      predictor:
+        minReplicas: ${KSERVE_SERVICE_DEFAULT_MIN_REPLICAS:1}
+        maxReplicas: ${KSERVE_SERVICE_DEFAULT_MAX_REPLICAS:1}
+  text-classification-transformer-container-config:
+    name: kserve-container
+    image: ${INFERENCE_TEXT_CLASSIFICATION_TRANSFORMER_IMAGE:}
+    resources:
+      requests:
+        cpu: ${INFERENCE_TEXT_CLASSIFICATION_TRANSFORMER_CPU_REQUEST:100m}
+        memory: ${INFERENCE_TEXT_CLASSIFICATION_TRANSFORMER_MEMORY_REQUEST:256Mi}
+      limits:
+        cpu: ${INFERENCE_TEXT_CLASSIFICATION_TRANSFORMER_CPU_LIMIT:500m}
+        memory: ${INFERENCE_TEXT_CLASSIFICATION_TRANSFORMER_MEMORY_LIMIT:512Mi}
+  builder-job-config:
+    apiVersion: batch/v1
+    kind: Job
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          volumes:
+            - name: workspace-volume
+              emptyDir: { }
+            - name: build-volume
+              emptyDir: { }
+  init-builder-container-config:
+    name: init-container
+    image: ${app.git-clone-image}
+    volumeMounts:
+      - name: workspace-volume
+        mountPath: /workspace
+  builder-root-container-config:
+    name: builder-container
+    image: ${app.builder-root-image}
+    command:
+      - /bin/sh
+      - -c
+      - 'buildctl-daemonless.sh "$@"; CODE=$?; [ "$CODE" -ne 0 ] && touch /image-build/build-failed; exit $CODE'
+      - "--"
+    args:
+      - build
+      - --frontend
+      - dockerfile.v0
+      - --output
+      - type=docker,dest=/image-build/image-tarball.tar
+    securityContext:
+      privileged: true
+    volumeMounts:
+      - name: workspace-volume
+        mountPath: /workspace
+      - name: build-volume
+        mountPath: /image-build
+  builder-rootless-container-config:
+    name: builder-container
+    image: ${app.builder-rootless-image}
+    command:
+      - /bin/sh
+      - -c
+      - 'buildctl-daemonless.sh "$@"; CODE=$?; [ "$CODE" -ne 0 ] && touch /image-build/build-failed; exit $CODE'
+      - "--"
+    env:
+      - name: BUILDKITD_FLAGS
+        value: "--oci-worker-no-process-sandbox"
+    args:
+      - build
+      - --frontend
+      - dockerfile.v0
+      - --output
+      - type=docker,dest=/image-build/image-tarball.tar
+    securityContext:
+      runAsUser: 1000
+      runAsGroup: 1000
+      appArmorProfile:
+        type: Unconfined
+    volumeMounts:
+      - name: workspace-volume
+        mountPath: /workspace
+      - name: build-volume
+        mountPath: /image-build
+  push-container-config:
+    name: push-container
+    image: ${app.copy-image}
+    command:
+      - /bin/sh
+      - -c
+    env:
+      - name: MAX_RETRIES
+        value: "120"
+      - name: AUTH_FILE_PATH
+        value: "/kaniko/.docker/config.json"
+      - name: SLEEP_INTERVAL_IN_SECONDS
+        value: "2"
+      - name: TAR_PATH
+        value: "/image-build/image-tarball.tar"
+    args: |
+      RETRY=0
+      echo "[push-container] Waiting for image tarball to be created and stable..."
+      while [ $RETRY -lt $MAX_RETRIES ]; do
+        if [ -f "/image-build/build-failed" ]; then
+          echo "[push-container] ERROR: Builder reported failure. Exiting."
+          exit 1
+        fi
+        if [ -f "$TAR_PATH" ]; then
+          SIZE1=$(stat -c%s "$TAR_PATH")
+          sleep ${SLEEP_INTERVAL_IN_SECONDS}
+          SIZE2=$(stat -c%s "$TAR_PATH")
+          if [ "$SIZE1" -eq "$SIZE2" ] && [ "$SIZE1" -gt 0 ]; then
+            echo "[push-container] Image tarball found and stable. Starting push with Skopeo..."
+            skopeo copy docker-archive:${TAR_PATH} docker://${TARGET_IMAGE} --authfile ${AUTH_FILE_PATH}
+            if [ $? -eq 0 ]; then
+              echo "[push-container] Image push completed successfully."
+              exit 0
+            else
+              echo "[push-container] ERROR: Image push failed."
+              exit 1
+            fi
+          else
+            echo "[push-container] Tarball exists but is still being written. Waiting..."
+          fi
+        else
+          echo "[push-container] Image tarball not found yet. Sleeping... ($RETRY/$MAX_RETRIES)"
+        fi
+        sleep ${SLEEP_INTERVAL_IN_SECONDS}
+        RETRY=$((RETRY+1))
+      done
+      echo "[push-container] ERROR: Image tarball not found or not stable after $MAX_RETRIES attempts. Exiting."
+      exit 1
+    securityContext:
+      capabilities:
+        drop:
+          - ALL
+      privileged: false
+      seLinuxOptions: {}
+      runAsUser: 1000
+      runAsGroup: 1000
+      runAsNonRoot: true
+      readOnlyRootFilesystem: true
+      allowPrivilegeEscalation: false
+      seccompProfile:
+        type: RuntimeDefault
+    volumeMounts:
+      - name: build-volume
+        mountPath: /image-build
+  builder-secret-config:
+    apiVersion: v1
+    kind: Secret
+  analyzer-job-config:
+    apiVersion: batch/v1
+    kind: Job
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+  analyzer-container-config:
+    name: builder-container
+    image: ${app.analyser-image}
+  copy-image-job-config:
+    apiVersion: batch/v1
+    kind: Job
+    spec:
+      backoffLimit: 0
+      template:
+        spec:
+          automountServiceAccountToken: false
+          restartPolicy: Never
+  copy-image-container-config:
+    name: builder-container
+    image: ${app.copy-image}
+  customizable-trace-interceptor:
+    enabled: ${CUSTOMIZABLE_TRACE_INTERCEPTOR_ENABLED:true}
+    messages:
+      ENTER: "${CUSTOMIZABLE_TRACE_INTERCEPTOR_ENTER_MESSAGE:'Enter:$[methodName](): $[arguments]'}"
+      EXIT: "${CUSTOMIZABLE_INTERCEPTOR_EXIT_MESSAGE:'Exit:$[methodName]():in $[invocationTime] ms, returnValue: $[returnValue]'}"
+      EXCEPTION: "${CUSTOMIZABLE_TRACE_INTERCEPTOR_EXCEPTION_MESSAGE:'Exception:$[methodName](): in $[invocationTime] ms'}"
+  trace-log-advisor:
+    expression: "@annotation(com.epam.aidial.deployment.manager.configuration.logging.LogExecution) || @within(com.epam.aidial.deployment.manager.configuration.logging.LogExecution)"
+
+config:
+  rest:
+    security:
+      mode: ${CONFIG_REST_SECURITY_MODE:none}
+      require-email: ${SECURITY_REQUIRE_EMAIL:false}
+      disable-swagger-authorization: ${DISABLE_SWAGGER_AUTHORIZATION:false}
+      default:
+        roles-mapping: "${SECURITY_ROLES_MAPPING:{\"ConfigAdmin\":[\"FULL_ADMIN\"],\"admin\":[\"FULL_ADMIN\"]}}"
+        email-claim: ${CLAIMS_EMAIL_KEY:unique_name}
+        principal-claim: ${SECURITY_USER_CLAIM:oid}
+      api-key:
+        enabled: ${API_KEY_ENABLED:false}
+        core-url: ${API_KEY_CORE_URL:}
+        cache-ttl-seconds: ${API_KEY_CACHE_TTL_SECONDS:60}
+        cache-max-size: ${API_KEY_CACHE_MAX_SIZE:10000}
+        request-timeout-ms: ${API_KEY_REQUEST_TIMEOUT_MS:3000}
+        roles-mapping: "${API_KEY_ROLES_MAPPING:}"
+        startup-probe: ${API_KEY_STARTUP_PROBE:true}
+
+azure:
+  auth:
+    type: ${AUTH_AZURE_TYPE:none}
+    clientId: ${AZURE_CLIENT_ID}
+    tenantId: ${AZURE_TENANT_ID}
+    clientSecret: ${AZURE_CLIENT_SECRET}
+
+http:
+  client:
+    connectTimeout: ${HTTP_CLIENT_CONNECT_TIMEOUT:30000}
+    readTimeout: ${HTTP_CLIENT_READ_TIMEOUT:60000}
+    writeTimeout: ${HTTP_CLIENT_WRITE_TIMEOUT:60000}
+
+datasource:
+  vendor: ${DATASOURCE_VENDOR:H2}
+  auth:
+    type: ${DATASOURCE_AUTH_TYPE:basic}
+
+h2:
+  datasource:
+    url: jdbc:h2:file:${H2_FILE:./deployment_manager};${H2_OPS:CIPHER=AES;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE}
+    driver-class-name: org.h2.Driver
+    username: sa
+    masterKey: ${H2_DATASOURCE_MASTER_KEY}
+    encryptedFileKey: ${H2_DATASOURCE_ENCRYPTED_FILE_KEY}
+    password: ${H2_DATASOURCE_PASSWORD}
+
+postgres:
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DATABASE:testdb}?${POSTGRES_OPS:}
+    driver-class-name: org.postgresql.Driver
+    username: ${POSTGRES_DATASOURCE_USERNAME:postgres}
+    password: ${POSTGRES_DATASOURCE_PASSWORD:postgres}
+
+sqlserver:
+  datasource:
+    url: jdbc:sqlserver://${MS_SQL_SERVER_HOST:localhost}:${MS_SQL_SERVER_PORT:1433};database=${MS_SQL_SERVER_DATABASE:testdb};${MS_SQL_SERVER_OPS:encrypt=false;}
+    driver-class-name: com.microsoft.sqlserver.jdbc.SQLServerDriver
+    username: ${MS_SQL_SERVER_DATASOURCE_USERNAME:sa}
+    password: ${MS_SQL_SERVER_DATASOURCE_PASSWORD:SQLServerPassword1}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: prometheus,health
+  endpoint:
+    health:
+      show-details: always
+  server:
+    port: 9464
+  opentelemetry:
+    # Spring Boot 4.1+ maps standard OTEL_* SDK env vars (OTEL_SDK_DISABLED, OTEL_*_EXPORTER, OTEL_EXPORTER_OTLP_PROTOCOL, ...)
+    # with precedence over this file; disabled so the OTEL_*_EXPORT_ENABLED / OTEL_EXPORTER_OTLP_TRANSPORT contract stays the only one
+    map-environment-variables: false
+    resource-attributes:
+      "service.name": ${OTEL_SERVICE_NAME:dial-deployment-manager-backend}
+    tracing:
+      export:
+        otlp:
+          # the base endpoint default must stay: Spring evaluates these properties even with export disabled,
+          # and http://localhost:4318 is the OpenTelemetry spec default for OTLP over HTTP
+          endpoint: ${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/traces}
+          transport: ${OTEL_EXPORTER_OTLP_TRANSPORT:http}
+    logging:
+      export:
+        otlp:
+          endpoint: ${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT:${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/logs}
+          transport: ${OTEL_EXPORTER_OTLP_TRANSPORT:http}
+  tracing:
+    export:
+      enabled: ${OTEL_TRACES_EXPORT_ENABLED:${OTEL_EXPORT_ENABLED:false}}
+    sampling:
+      # parent-based ratio sampler; 1.0 mirrors the always-on default the OpenTelemetry SDK used before Spring Boot 4
+      probability: ${OTEL_TRACES_SAMPLING_PROBABILITY:1.0}
+  logging:
+    export:
+      otlp:
+        enabled: ${OTEL_LOGS_EXPORT_ENABLED:${OTEL_EXPORT_ENABLED:false}}
+  otlp:
+    metrics:
+      export:
+        enabled: ${OTEL_METRICS_EXPORT_ENABLED:${OTEL_EXPORT_ENABLED:false}}
+        url: ${OTEL_EXPORTER_OTLP_METRICS_ENDPOINT:${OTEL_EXPORTER_OTLP_ENDPOINT:http://localhost:4318}/v1/metrics}
+
+server:
+  tomcat:
+    accesslog:
+      pattern: "request: method=%m uri=\"%U\" response: statuscode=%s bytes=%b duration=%D(ms) client: remoteip=%a user=%u useragent=\"%{User-Agent}i\""
+      enabled: ${TOMCAT_ACCESSLOG_ENABLED:false}
+
+logger:
+  configuration:
+    path: ${LOG_CONFIG_PATH:log-config/logging.levels.json}
+    interval: ${LOG_CONFIG_INTERVAL:10}
+

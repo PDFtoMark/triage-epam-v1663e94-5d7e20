@@ -1,0 +1,39 @@
+{
+  "apiVersion": "serving.kserve.io/v1beta1",
+  "kind": "InferenceService",
+  "metadata": {
+    "annotations": {
+      "autoscaling.knative.dev/initial-scale": "1",
+      "serving.knative.dev/progress-deadline": "3630s"
+    },
+    "name": "dm-resource-inference-app"
+  },
+  "spec": {
+    "predictor": {
+      "minReplicas": 1,
+      "maxReplicas": 1,
+      "model": {
+        "args": [
+          "--model_name",
+          "resource-inference-app"
+        ],
+        "env": [],
+        "modelFormat": {
+          "name": "huggingface"
+        },
+        "resources": {
+          "limits": {
+            "cpu": "2000m",
+            "memory": "8Gi",
+            "nvidia.com/gpu": "1"
+          },
+          "requests": {
+            "memory": "2Gi",
+            "nvidia.com/gpu": "1"
+          }
+        },
+        "storageUri": "s3://my-bucket/resource-model"
+      }
+    }
+  }
+}

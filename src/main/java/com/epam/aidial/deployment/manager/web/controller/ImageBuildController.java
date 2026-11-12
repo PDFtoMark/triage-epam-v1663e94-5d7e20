@@ -1,0 +1,84 @@
+package com.epam.aidial.deployment.manager.web.controller;
+
+import com.epam.aidial.deployment.manager.configuration.logging.LogExecution;
+import com.epam.aidial.deployment.manager.exception.EntityNotFoundException;
+import com.epam.aidial.deployment.manager.service.ImageBuildLogsService;
+import com.epam.aidial.deployment.manager.service.ImageBuildRunner;
+import com.epam.aidial.deployment.manager.service.ImageBuildStopService;
+import com.epam.aidial.deployment.manager.service.ImageDefinitionService;
+import com.epam.aidial.deployment.manager.web.dto.CreateBuildImageRequestDto;
+import com.epam.aidial.deployment.manager.web.dto.ImageBuildDetailsDto;
+import com.epam.aidial.deployment.manager.web.mapper.ImageBuildDetailsDtoMapper;
+import com.epam.aidial.deployment.manager.web.security.FullAdminOnly;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.util.MimeTypeUtils;
+import org.springframework.web.bind.annotation.DeleteMapping;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.ResponseStatus;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.util.UUID;
+
+@Slf4j
+@LogExecution
+@RestController
+@RequestMapping("/api/v1/images/builds")
+@RequiredArgsConstructor
+public class ImageBuildController {
+
+    private final ImageBuildLogsService imageBuildLogsService;
+    private final ImageDefinitionService imageDefinitionService;
+    private final ImageBuildRunner imageBuildRunner;
+    private final ImageBuildStopService imageBuildStopService;
+    private final ImageBuildDetailsDtoMapper dtoMapper;
+
+    @FullAdminOnly
+    @PostMapping(consumes = MimeTypeUtils.APPLICATION_JSON_VALUE)
+    @ResponseStatus(HttpStatus.CREATED)
+    public void buildImage(@RequestBody @Valid CreateBuildImageRequestDto requestDto) {
+        imageBuildRunner.buildImage(requestDto.imageDefinitionId());
+    }
+
+    @Operation(summary = "Stop an in-progress image build")
+    @ApiResponse(responseCode = "204", description = "Build stopped successfully")
+    @ApiResponse(responseCode = "400", description = "Build is not in progress or cluster-side deletion failed")
+    @ApiResponse(responseCode = "404", description = "Image definition not found")
+    @FullAdminOnly
+    @DeleteMapping(path = "/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void stopImageBuild(@PathVariable UUID id) {
+        imageBuildStopService.stopBuild(id);
+    }
+
+    @GetMapping(path = "{id}/status",
+            produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter subscribeToStatus(@PathVariable UUID id) {
+        return imageBuildLogsService.streamStatus(id);
+    }
+
+    @GetMapping(path = "/{id}/details",
+            produces = MimeTypeUtils.APPLICATION_JSON_VALUE)
+    public ImageBuildDetailsDto getImageBuildLogsById(@PathVariable UUID id) {
+        return imageDefinitionService.getImageDefinition(id)
+                .map(dtoMapper::toDto)
+                .orElseThrow(() -> new EntityNotFoundException("ImageDefinition not found by id: %s".formatted(id)));
+    }
+
+    @GetMapping(path = "{id}/logs",
+            produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter subscribeToLogs(@PathVariable UUID id) {
+        return imageBuildLogsService.streamLogs(id);
+    }
+
+}

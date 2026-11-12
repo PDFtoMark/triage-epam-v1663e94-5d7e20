@@ -1,0 +1,177 @@
+# Inference Deployments
+
+## Purpose
+This spec describes deployments of type INFERENCE — a model-source deployment for serving AI inference models via KServe. Unlike image-based deployments, inference deployments do not reference an `ImageDefinition`; they reference a model source directly and support scaling configuration.
+
+Status: **Implemented**
+
+## Key Terms
+- **Inference deployment**: A deployment of type `INFERENCE` that serves an AI model using KServe as the backend runtime.
+- **Model source**: The origin of the model to serve. Uses the unified `Source` sealed interface; the only supported variant for inference is `HuggingFaceSource` (`$type: "huggingface"`). The source is stored as a JSON column on the base `deployment` table.
+- **KServe**: Kubernetes-native model serving framework used as the inference deployment backend.
+- **Scaling strategy**: An auto-scaling configuration that specifies the scaling trigger type and threshold.
+
+## Requirements
+
+### Requirement: Inference deployment uses model source instead of image definition
+An inference deployment SHALL reference a model source (not an `imageDefinitionId`) to identify the model to serve. The `imageDefinitionId` field SHALL NOT be present.
+
+Status: **Implemented**
+
+#### Scenario: Create inference deployment with model source
+- **WHEN** `POST /api/v1/deployments` is called with `type: INFERENCE` and a model source
+- **THEN** an inference deployment is persisted with the model source and base deployment fields
+
+#### Scenario: Retrieve inference deployment
+- **WHEN** `GET /api/v1/deployments/{id}` is called for an INFERENCE deployment
+- **THEN** the response includes the model source and inference-specific configuration (no `imageDefinitionId`)
+
+### Requirement: Inference deployment supports HuggingFace as model source
+An inference deployment SHALL accept a HuggingFace model hub reference as its source. The model name must pass the `@ValidHuggingFaceModelName` format constraint.
+
+Status: **Implemented**
+
+#### Scenario: HuggingFace source
+- **WHEN** an inference deployment is created with `source.$type: "huggingface"` and a valid `modelName`
+- **THEN** the HuggingFace model reference is persisted and used for KServe manifest generation
+
+#### Scenario: Invalid model name
+- **WHEN** an inference deployment is created with a `modelName` that fails `@ValidHuggingFaceModelName` validation
+- **THEN** the system responds with 400
+
+### Requirement: Inference deployment supports model format
+An inference deployment SHALL carry a required `modelFormat` field that identifies the model serving framework (e.g., `"pytorch"`, `"tensorflow"`).
+
+Status: **Implemented**
+
+#### Scenario: Model format required
+- **WHEN** `POST /api/v1/deployments` is called with `type: INFERENCE` without `modelFormat`
+- **THEN** the system responds with 400
+
+#### Scenario: Model format stored and returned
+- **WHEN** an inference deployment is created with a valid `modelFormat`
+- **THEN** `modelFormat` is persisted and included in all deployment responses
+
+### Requirement: Inference deployment supports custom command and arguments
+An inference deployment uses the base-level `command` and `args` fields (see `deployments` spec) to override the container entrypoint and arguments. These fields were consolidated from the Inference-specific level to the base Deployment level to enable all deployment types to use them.
+
+Status: **Implemented** (consolidated to base level)
+
+#### Scenario: Command and args stored
+- **WHEN** an inference deployment is created with `command` or `args` values
+- **THEN** they are persisted and passed to KServe for manifest generation
+
+### Requirement: Inference deployment uses base scaling configuration for KServe
+An inference deployment uses the base `scaling` field (see `deployments` spec) to configure KServe-specific horizontal scaling behavior. The `ScalingDto` maps to KServe predictor-level scaling: `minReplicas`, `maxReplicas`, scale metric, and scale-to-zero delay. KServe supports all scaling strategy types (`PENDING_REQUESTS`, `ACTIVE_REQUESTS`, `HARDWARE_USAGE`).
+
+Status: **Implemented**
+
+#### Scenario: Scaling configuration applied to KServe
+- **WHEN** an inference deployment is created or updated with a `scaling` object
+- **THEN** the scaling parameters are used for KServe autoscaler configuration (predictor replicas, scale metric, scale-to-zero)
+
+### Requirement: Inference deployment is backed by KServe
+When KServe is enabled (`app.kserve.enabled=true`), the system SHALL generate a KServe `InferenceService` manifest for inference deployments during deploy.
+
+Status: **Implemented**
+
+#### Scenario: KServe manifest created on deploy
+- **WHEN** `POST /api/v1/deployments/{id}/deploy` is called for an INFERENCE deployment with `app.kserve.enabled=true`
+- **THEN** a KServe `InferenceService` resource is created in the Kubernetes namespace
+
+#### Scenario: Deploy with KServe disabled
+- **WHEN** `POST /api/v1/deployments/{id}/deploy` is called for an INFERENCE deployment with `app.kserve.enabled=false`
+- **THEN** the deploy operation fails or is skipped with an appropriate error
+
+### Requirement: Transformer image pull secret auto-provisioned for trusted registries
+When a chained text-classification transformer's operator-configured image is served from a credentialed configured registry (and `app.registry.auto-pull-secret-enabled` is true), the deploy flow SHALL auto-provision a `kubernetes.io/dockerconfigjson` pull secret and set `spec.transformer.imagePullSecrets` on the generated InferenceService. The predictor is never given an auto pull secret (its model is loaded via `storageUri`, not a private container image). See [kubernetes-manifests](../kubernetes-manifests/spec.md).
+
+Status: **Implemented** — Implemented via 025-auto-pull-secrets
+
+### Requirement: Auto-detect inference task from model metadata
+On every deploy of a HuggingFace-sourced inference deployment, the system SHALL fetch the model's HF Hub metadata and compute a `task` (one of `TEXT_CLASSIFICATION` / `TEXT_GENERATION` / `NONE`) plus an optional `id2Label` map. At deploy time the result flows directly into manifest generation. The same detection also runs at create/update time and the resulting `task` is persisted on the deployment and exposed read-only as `inferenceTask` (see "Expose serving capability on inference deployment responses"). The `id2Label` map remains transient (deploy-time only).
+
+When a model satisfies more than one task signal, detection applies a fixed precedence: text-classification is evaluated first (the more specific signal that drives the transformer chain), then text-generation, otherwise `NONE`.
+
+Status: **Implemented** *(Implemented via 021-inference-task-transformer; extended with TEXT_GENERATION + persistence via 024-model-serving-capability)*
+
+#### Scenario: Text-classification model detected
+- **WHEN** a deploy is requested for a model whose `pipeline_tag` is `text-classification` OR whose `architectures` list contains an entry matching `.*ForSequenceClassification`
+- **THEN** detection returns `TEXT_CLASSIFICATION` and the model's `config.json` `id2label` is parsed into the `id2Label` map
+
+#### Scenario: Text-generation model detected
+- **WHEN** a deploy is requested for a model whose `pipeline_tag` is `text-generation` OR whose `architectures` list contains an entry matching `.*(ForCausalLM|ForConditionalGeneration|LMHeadModel)`, and the text-classification signal does not match
+- **THEN** detection returns `TEXT_GENERATION` and the manifest is generated predictor-only (no transformer, identical to `NONE`)
+
+#### Scenario: Both signals present
+- **WHEN** a model satisfies both the text-classification and text-generation signals
+- **THEN** detection returns `TEXT_CLASSIFICATION` (classification precedence)
+
+#### Scenario: Non-classification, non-generation model detected
+- **WHEN** a deploy is requested for a model whose HF metadata satisfies none of the signals
+- **THEN** detection returns `NONE` and the manifest is generated predictor-only (unchanged from pre-feature behavior)
+
+### Requirement: Reject unusable model metadata at deploy time
+When detection classifies a model as `TEXT_CLASSIFICATION` but its `config.json` `id2label` fails the structural contract (missing, non-integer keys, sparse keys, empty values, or all values matching `^LABEL_\d+$`), the deploy SHALL be rejected with HTTP 400 and an actionable message naming the model and the specific failed condition. Model-not-found / unauthorized HF responses are also surfaced as HTTP 400; transient HF Hub failures surface as HTTP 502 with a retryable message. No cluster mutation occurs.
+
+Status: **Implemented** *(Implemented via 021-inference-task-transformer)*
+
+#### Scenario: Missing id2label
+- **WHEN** a deploy is requested for a sequence-classification model whose `config.json` lacks an `id2label`
+- **THEN** the deploy fails with HTTP 400 and a message naming the model
+
+#### Scenario: Stub labels
+- **WHEN** every value in the model's `id2label` matches HuggingFace's auto-stub pattern `^LABEL_\d+$`
+- **THEN** the deploy fails with HTTP 400
+
+#### Scenario: HF Hub unreachable
+- **WHEN** the HF Hub responds with 5xx / DNS / timeout / network error during deploy
+- **THEN** the deploy fails with HTTP 502 and a retryable error message
+
+#### Scenario: Operator-supplied predictor arg conflicts with chained contract
+- **WHEN** a `TEXT_CLASSIFICATION`-detected deployment carries `--return_probabilities` or `--task=<non-sequence_classification>` in its predictor args
+- **THEN** the deploy fails with HTTP 400 before any cluster mutation
+
+### Requirement: Expose serving capability on inference deployment responses
+The detected `task` SHALL be persisted on the inference deployment at create time and re-evaluated whenever the model source changes, and SHALL be exposed read-only as `inferenceTask` on the inference deployment response (single fetch and list). The value is one of `TEXT_GENERATION` / `TEXT_CLASSIFICATION` / `NONE`; a deployment with no persisted value (created before this feature) is reported as `NONE`. Clients cannot set the value (it is absent from the create/update request). The capability carries no endpoint URL or path — the frontend maps the value to a consumption surface (`TEXT_GENERATION` → chat completion, `TEXT_CLASSIFICATION` → MCP toolset). The value is excluded from config export/import (it is re-derived on import).
+
+Status: **Implemented** *(Implemented via 024-model-serving-capability)*
+
+#### Scenario: Capability returned for a deployed model
+- **WHEN** an inference deployment created from a text-generation model is fetched
+- **THEN** the response includes `inferenceTask: TEXT_GENERATION`
+
+#### Scenario: Capability updates when model source changes
+- **WHEN** an inference deployment's model source is changed to a model of a different task
+- **THEN** the persisted `inferenceTask` is re-evaluated and the next fetch reflects the new task
+
+#### Scenario: Absent value reported as NONE
+- **WHEN** an inference deployment has no persisted capability (predates the feature)
+- **THEN** the response reports `inferenceTask: NONE`
+
+Existing rows that predate the column are backfilled to `NONE` by the `DEFAULT 'NONE'` on the `V1.59` column (the main column is `NOT NULL`; the real task is re-detected on the next deploy/update).
+
+## Implementation Notes
+- Domain model: `com.epam.aidial.deployment.manager.model.deployment.InferenceDeployment`
+  - Fields: `modelFormat` (String), `inferenceTask` (`InferenceTask`, system-computed, `@JsonIgnore` so it is excluded from export/import). Note: `source`, `command`, and `args` are inherited from the base `Deployment` model.
+- Source domain model: `com.epam.aidial.deployment.manager.model.deployment.Source` (unified sealed interface; inference uses `HuggingFaceSource` variant)
+- HuggingFace source domain model: `com.epam.aidial.deployment.manager.model.deployment.HuggingFaceSource`
+- Request DTO: `com.epam.aidial.deployment.manager.web.dto.deployment.CreateInferenceDeploymentRequestDto`
+  - Fields: `modelFormat` (required String), `source` (required `InferenceDeploymentSourceDto`). Note: `command` and `args` are inherited from the base request DTO.
+- Response DTO: `com.epam.aidial.deployment.manager.web.dto.deployment.InferenceDeploymentDto`
+  - Fields: `modelFormat` (required String), `source` (required `InferenceDeploymentSourceDto`), `inferenceTask` (read-only `InferenceTask`, null coalesced to `NONE` by `DeploymentDtoMapper`). Note: `command` and `args` are inherited from the base response DTO.
+- Source DTO (interface): `com.epam.aidial.deployment.manager.web.dto.deployment.InferenceDeploymentSourceDto` (`$type` discriminator)
+- HuggingFace source DTO (record): `com.epam.aidial.deployment.manager.web.dto.deployment.InferenceDeploymentHuggingFaceSourceDto` (`modelName` with `@NotNull @ValidHuggingFaceModelName`)
+- Persistence source: stored as `PersistenceHuggingFaceSource` within the unified `PersistenceSource` JSON column on base `DeploymentEntity`
+- Probe converter: `com.epam.aidial.deployment.manager.service.manifest.KserveProbeConverter`
+- Deployment manager: `com.epam.aidial.deployment.manager.service.deployment.InferenceDeploymentManager` (active when `app.kserve.enabled=true`)
+- Manifest generator: `com.epam.aidial.deployment.manager.service.manifest.InferenceManifestGenerator`
+- Detector: `com.epam.aidial.deployment.manager.service.detection.InferenceTaskDetector` (runs at create/update time → persisted `inferenceTask`, and at deploy time → manifest/`id2Label`). Persistence is wired via `InferenceDeploymentManager#enrichBeforePersist`, called by `DeploymentService` create/update; the entity column is `inference_deployment.inference_task` (migration `V1.59`).
+  - Exception hierarchy: `InferenceTaskDetectionException` (base), `ModelMetadataMissingException` / `ModelMetadataUnusableException` / `ModelNotFoundException` → HTTP 400; `HuggingFaceUpstreamException` → HTTP 502
+- Missing-image gate: `com.epam.aidial.deployment.manager.service.deployment.MissingTransformerImageException` → HTTP 500
+- Transformer manifest section: `com.epam.aidial.deployment.manager.service.manifest.TextClassificationTransformerSection` (emits the `transformer` block when detection returns `TEXT_CLASSIFICATION`). It also stamps the `prometheus.kserve.io/port: "8080"` + `prometheus.kserve.io/path: "/metrics"` annotations on `spec.transformer` (KServe auto-stamps these on a runtime-backed predictor but not on a user-supplied transformer container) so the transformer pod advertises a scrape target that `DeploymentMetricsService` consumes — see `specs/deployment-metrics/spec.md`. Operator-supplied values win (`putIfAbsent`).
+- Chained-mode `CiliumNetworkPolicy` augmentation: the per-deployment policy carries an intra-cluster egress block (same-`InferenceService` + `istio-system:istiod` + `istio-system:istio-ingressgateway` + `knative-serving:activator` + `knative-serving:autoscaler` + `knative-serving:controller`), a same-`InferenceService` entry in the ingress `fromEndpoints`, the `*.<namespace>.svc.cluster.local` matchPattern appended to the kube-dns DNS rule list (scoped to the deployment's own namespace, so the transformer can resolve the predictor's cluster-local name regardless of `allowedDomains` without gaining cross-namespace DNS reach), and `8080/TCP` on ingress `toPorts` (sourced from the deployment's resolved container ports) — emitted for any chained deployment; baseline shape preserved for predictor-only. See `specs/kubernetes-manifests/spec.md` § "Chained predictor + transformer". *(Implemented via 022-transformer-cilium-policies)*
+- Chained-mode signal threading: `InferenceDeploymentManager` overrides the `buildCiliumNetworkPolicy(D, S, ...)` hook on `AbstractDeploymentManager` and reads chained-ness directly from the in-flight `InferenceService` (on deploy / rollingUpdate) or the live cluster resource (on `updateCiliumNetworkPolicy(id)`). No persistence, no partial-manifest re-parsing, no leak of the chained concept into the abstract base.
+- Kubernetes backend: KServe `InferenceService` resources via `K8sKserveClient` (conditioned on `app.kserve.enabled=true`)
+- K8s package: `com.epam.aidial.deployment.manager.kubernetes.kserve.*`
+- Related specs: `deployments` (base + lifecycle), `kubernetes-manifests`, `huggingface`, `deployment-metrics` (live serving-quality snapshot — `GET /api/v1/deployments/{id}/metrics`)

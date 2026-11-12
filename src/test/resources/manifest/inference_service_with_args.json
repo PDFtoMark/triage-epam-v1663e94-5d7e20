@@ -1,0 +1,36 @@
+{
+  "apiVersion": "serving.kserve.io/v1beta1",
+  "kind": "InferenceService",
+  "metadata": {
+    "annotations": {
+      "autoscaling.knative.dev/initial-scale": "1",
+      "serving.knative.dev/progress-deadline": "3630s"
+    },
+    "name": "dm-args-inference-app"
+  },
+  "spec": {
+    "predictor": {
+      "minReplicas": 1,
+      "maxReplicas": 1,
+      "model": {
+        "args": [
+          "--arg1",
+          "value1",
+          "--arg2",
+          "value2",
+          "--model_name",
+          "args-inference-app"
+        ],
+        "env": [],
+        "modelFormat": {
+          "name": "huggingface"
+        },
+        "resources": {
+          "limits": {},
+          "requests": {}
+        },
+        "storageUri": "s3://my-bucket/args-model"
+      }
+    }
+  }
+}

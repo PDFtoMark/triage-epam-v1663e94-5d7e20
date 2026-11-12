@@ -1,0 +1,43 @@
+[
+  {
+    "$type": "mcp",
+    "name": "decade00-0000-4000-a000-000000000000",
+    "source": {
+      "$type": "internal_image",
+      "imageDefinitionId": "decade00-0000-4000-a000-000000000010",
+      "imageDefinitionName": "test-image",
+      "imageDefinitionVersion": "1.2.3"
+    },
+    "displayName": "example deployment 1",
+    "description": "Description of example deployment 1",
+    "author": "user1@test.com",
+    "resources": {
+      "limits": {"cpu": "10"},
+      "requests": {"cpu": "5"}
+    },
+    "status": "running",
+    "url": "http://example.com/deployment1/mcp",
+    "createdAt": 1745996228431,
+    "updatedAt": 1745996228431
+  },
+  {
+    "$type": "mcp",
+    "name": "decade00-0000-4000-a000-000000000001",
+    "source": {
+      "$type": "internal_image",
+      "imageDefinitionId": "decade00-0000-4000-a000-000000000010",
+      "imageDefinitionName": "test-image-1",
+      "imageDefinitionVersion": "1.0.0"
+    },
+    "displayName": "example deployment 2",
+    "description": "Description of example deployment 2",
+    "author": "user2@test.com",
+    "resources": {
+      "limits": {"cpu": "10"},
+      "requests": {"cpu": "5"}
+    },
+    "status": "not_deployed",
+    "createdAt": 1745996228431,
+    "updatedAt": 1745996228431
+  }
+]

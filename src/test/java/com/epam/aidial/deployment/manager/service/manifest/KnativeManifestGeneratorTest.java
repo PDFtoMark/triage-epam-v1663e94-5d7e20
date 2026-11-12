@@ -1,0 +1,373 @@
+package com.epam.aidial.deployment.manager.service.manifest;
+
+import com.epam.aidial.deployment.manager.configuration.AppProperties;
+import com.epam.aidial.deployment.manager.configuration.JsonMapperConfiguration;
+import com.epam.aidial.deployment.manager.kubernetes.knative.KnativeAnnotations;
+import com.epam.aidial.deployment.manager.model.Resources;
+import com.epam.aidial.deployment.manager.model.Scaling;
+import com.epam.aidial.deployment.manager.model.ScalingStrategy;
+import com.epam.aidial.deployment.manager.model.ScalingStrategyType;
+import com.epam.aidial.deployment.manager.model.SensitiveEnvVar;
+import com.epam.aidial.deployment.manager.model.SimpleEnvVar;
+import com.epam.aidial.deployment.manager.model.SimpleEnvVarValue;
+import com.epam.aidial.deployment.manager.model.probe.HttpGetProbe;
+import com.epam.aidial.deployment.manager.model.probe.ProbeProperties;
+import com.epam.aidial.deployment.manager.utils.ResourceUtils;
+import io.fabric8.knative.serving.v1.Service;
+import io.fabric8.kubernetes.api.model.Container;
+import org.json.JSONException;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.skyscreamer.jsonassert.JSONAssert;
+import tools.jackson.databind.ObjectMapper;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class KnativeManifestGeneratorTest {
+
+    private static final String DM_PREFIX = "dm-";
+
+    private final ObjectMapper objectMapper = JsonMapperConfiguration.createPrettyJsonMapper();
+
+    @Mock
+    private AppProperties appconfig;
+    @Mock
+    private ProbeConverter probeConverter;
+    @Mock
+    private ProgressDeadlineCalculator progressDeadlineCalculator;
+    @InjectMocks
+    private KnativeManifestGenerator manifestGenerator;
+
+    @BeforeEach
+    void setupMocks() {
+        var baseServiceJson = ResourceUtils.readResource("/manifest/knative_service_template.json");
+        var baseService = objectMapper.readValue(baseServiceJson, Service.class);
+        var baseContainerJson = ResourceUtils.readResource("/manifest/knative_service_container_template.json");
+        var baseContainer = objectMapper.readValue(baseContainerJson, Container.class);
+
+        when(appconfig.cloneKnativeServiceConfig()).thenReturn(baseService);
+        when(appconfig.cloneKnativeServiceContainer()).thenReturn(baseContainer);
+        when(appconfig.getKnativeServiceContainerConfig()).thenReturn(baseContainer);
+    }
+
+    @Test
+    void testServiceConfig_withOverriddenEnvs() throws JSONException {
+        // Given
+        var deploymentName = "basic-app";
+        var imageName = "my-registry/my-image:latest";
+
+        var simpleEnvs = List.of(new SimpleEnvVar("SIMPLE_VAR", new SimpleEnvVarValue("simple_value")));
+        var sensitiveEnvs = List.of(new SensitiveEnvVar("SECRET_VAR", null, "my-secret", "secret-key"));
+        var resources = new Resources(Collections.emptyMap(), Collections.emptyMap());
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, simpleEnvs, sensitiveEnvs, Collections.emptyList(), imageName,
+                null, resources, null, null, null, null, null
+        );
+
+        // Then
+        var jsonOutput = serialize(generatedService);
+        var expected = ResourceUtils.readResource("/manifest/knative_service_with_envs.json");
+        JSONAssert.assertEquals(expected, jsonOutput, true);
+    }
+
+    @Test
+    void testServiceConfig_withOverriddenScaling() throws JSONException {
+        // Given
+        var deploymentName = "scaling-app";
+        var imageName = "my-registry/scaling-image:v1";
+        var scaling = new Scaling(0, 10, null, null);
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                scaling, new Resources(), null, null, null, null, null
+        );
+
+        // Then
+        var jsonOutput = serialize(generatedService);
+        var expected = ResourceUtils.readResource("/manifest/knative_service_with_scaling.json");
+        JSONAssert.assertEquals(expected, jsonOutput, true);
+    }
+
+    @Test
+    void testServiceConfig_withActiveRequestsStrategy_setsExplicitAutoscalingAnnotationsAndConcurrency() {
+        // Given
+        var deploymentName = "explicit-scaling-app";
+        var imageName = "my-registry/scaling-image:v1";
+        var strategy = new ScalingStrategy(ScalingStrategyType.ACTIVE_REQUESTS, 7);
+        var scaling = new Scaling(1, 5, null, strategy);
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                scaling, new Resources(), null, null, null, null, null
+        );
+
+        // Then: class/metric/target are written explicitly (not inherited from cluster defaults)
+        var annotations = generatedService.getSpec().getTemplate().getMetadata().getAnnotations();
+        assertThat(annotations)
+                .containsEntry(KnativeAnnotations.AUTOSCALING_CLASS, KnativeAnnotations.AUTOSCALING_CLASS_KPA)
+                .containsEntry(KnativeAnnotations.AUTOSCALING_METRIC, KnativeAnnotations.AUTOSCALING_METRIC_CONCURRENCY)
+                .containsEntry(KnativeAnnotations.AUTOSCALING_TARGET, "7")
+                .containsEntry(KnativeAnnotations.MIN_SCALE, "1")
+                .containsEntry(KnativeAnnotations.MAX_SCALE, "5")
+                .containsEntry(KnativeAnnotations.INITIAL_SCALE, "1");
+
+        // And: revision spec carries matching containerConcurrency
+        assertThat(generatedService.getSpec().getTemplate().getSpec().getContainerConcurrency()).isEqualTo(7L);
+    }
+
+    @Test
+    void testServiceConfig_withOverriddenResources() throws JSONException {
+        // Given
+        var deploymentName = "resource-app";
+        var imageName = "my-registry/resource-image:v1";
+
+        var limits = Map.of("cpu", "2000m", "memory", "8Gi");
+        var requests = Map.of("memory", "2Gi");
+        var resources = new Resources(limits, requests);
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, resources, null, null, null, null, null
+        );
+
+        // Then
+        var jsonOutput = serialize(generatedService);
+        var expected = ResourceUtils.readResource("/manifest/knative_service_with_resources.json");
+        JSONAssert.assertEquals(expected, jsonOutput, true);
+    }
+
+    @Test
+    public void testGenerateKnativeServiceWithContainerPort() {
+        // Given
+        var deploymentName = "port-app";
+        var imageName = "my-registry/port-image:v1";
+        var containerPort = 9000;
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), containerPort, null, null, null, null
+        );
+
+        // Then
+        assertThat(generatedService.getSpec().getTemplate().getSpec().getContainers())
+                .hasSize(1);
+
+        var container = generatedService.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        assertThat(container.getPorts())
+                .hasSize(1)
+                .first()
+                .satisfies(port -> assertThat(port.getContainerPort()).isEqualTo(9000));
+    }
+
+    @Test
+    public void testGenerateKnativeServiceWithoutContainerPortWhenNull() {
+        // Given
+        var deploymentName = "no-port-app";
+        var imageName = "my-registry/no-port-image:v1";
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, null, null, null, null
+        );
+
+        // Then
+        var container = generatedService.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        assertThat(container.getPorts()).isNullOrEmpty();
+    }
+
+    @Test
+    void testServiceConfig_withProbeProperties_setsProgressDeadlineAnnotation() {
+        // Given
+        var realCalculator = new ProgressDeadlineCalculator(0, 10, 3, 30);
+        var generatorWithRealConverter = new KnativeManifestGenerator(appconfig, new ProbeConverter(), realCalculator);
+        var deploymentName = "deadline-app";
+        var imageName = "my-registry/deadline-image:v1";
+        // deadline = 5 + ((2-1) * 10) + 3 + 30 = 48
+        var httpGet = new HttpGetProbe("/ready", 9090);
+        var probeProperties = new ProbeProperties(true, 5, 10, 3, 2, httpGet);
+
+        // When
+        var generatedService = generatorWithRealConverter.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, probeProperties, null, null, null
+        );
+
+        // Then
+        var annotations = generatedService.getSpec().getTemplate().getMetadata().getAnnotations();
+        assertThat(annotations).containsEntry("serving.knative.dev/progress-deadline", "48s");
+    }
+
+    @Test
+    void testServiceConfig_withoutProbe_doesNotSetProgressDeadlineAnnotation() {
+        // Given
+        var deploymentName = "no-deadline-app";
+        var imageName = "my-registry/no-deadline-image:v1";
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, null, null, null, null
+        );
+
+        // Then
+        var annotations = generatedService.getSpec().getTemplate().getMetadata().getAnnotations();
+        assertThat(annotations).doesNotContainKey("serving.knative.dev/progress-deadline");
+    }
+
+    @Test
+    void testServiceConfig_withProbeProperties_setsStartupProbeOnContainer() {
+        // Given: generator with real ProbeConverter so probe is built from properties
+        var realCalculator = new ProgressDeadlineCalculator(0, 10, 3, 30);
+        var generatorWithRealConverter = new KnativeManifestGenerator(appconfig, new ProbeConverter(), realCalculator);
+        var deploymentName = "probe-app";
+        var imageName = "my-registry/probe-image:v1";
+        var httpGet = new HttpGetProbe("/ready", 9090);
+        var probeProperties = new ProbeProperties(true, 5, 10, 3, 2, httpGet);
+
+        // When
+        var generatedService = generatorWithRealConverter.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, probeProperties, null, null, null
+        );
+
+        // Then: container has startup probe with expected path, port and timing
+        var container = generatedService.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        var startupProbe = container.getStartupProbe();
+        assertThat(startupProbe).isNotNull();
+        assertThat(startupProbe.getHttpGet()).isNotNull();
+        assertThat(startupProbe.getHttpGet().getPath()).isEqualTo("/ready");
+        assertThat(startupProbe.getHttpGet().getPort().getIntVal()).isEqualTo(9090);
+        assertThat(startupProbe.getInitialDelaySeconds()).isEqualTo(5);
+        assertThat(startupProbe.getPeriodSeconds()).isEqualTo(10);
+        assertThat(startupProbe.getTimeoutSeconds()).isEqualTo(3);
+        assertThat(startupProbe.getFailureThreshold()).isEqualTo(2);
+    }
+
+    @Test
+    void testServiceConfig_withCommandAndArgs_setsCommandAndArgsOnContainer() {
+        // Given
+        var deploymentName = "cmd-args-app";
+        var imageName = "my-registry/cmd-args-image:v1";
+        var command = List.of("/bin/sh", "-c");
+        var args = List.of("echo hello");
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, null, command, args, null
+        );
+
+        // Then
+        var container = generatedService.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        assertThat(container.getCommand()).containsExactly("/bin/sh", "-c");
+        assertThat(container.getArgs()).containsExactly("echo hello");
+    }
+
+    @Test
+    void testServiceConfig_withCommandOnly_setsCommandOnContainer() {
+        // Given
+        var deploymentName = "cmd-only-app";
+        var imageName = "my-registry/cmd-only-image:v1";
+        var command = List.of("python3");
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, null, command, null, null
+        );
+
+        // Then
+        var container = generatedService.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        assertThat(container.getCommand()).containsExactly("python3");
+        assertThat(container.getArgs()).isNullOrEmpty();
+    }
+
+    @Test
+    void testServiceConfig_withNullCommandAndArgs_doesNotSetCommandOrArgs() {
+        // Given
+        var deploymentName = "no-cmd-app";
+        var imageName = "my-registry/no-cmd-image:v1";
+
+        // When
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, null, null, null, null
+        );
+
+        // Then
+        var container = generatedService.getSpec().getTemplate().getSpec().getContainers().getFirst();
+        assertThat(container.getCommand()).isNullOrEmpty();
+        assertThat(container.getArgs()).isNullOrEmpty();
+    }
+
+    @Test
+    void testServiceConfig_projectsPoolPrimitivesOntoRevisionSpec() {
+        var deploymentName = "node-pool-app";
+        var imageName = "my-registry/node-pool-image:v1";
+        var affinity = new io.fabric8.kubernetes.api.model.AffinityBuilder()
+                .withNewNodeAffinity()
+                .withNewRequiredDuringSchedulingIgnoredDuringExecution()
+                .addNewNodeSelectorTerm()
+                .addNewMatchExpression()
+                .withKey("accelerator-type").withOperator("In").addToValues("nvidia-a100")
+                .endMatchExpression()
+                .endNodeSelectorTerm()
+                .endRequiredDuringSchedulingIgnoredDuringExecution()
+                .endNodeAffinity()
+                .build();
+        var toleration = new io.fabric8.kubernetes.api.model.TolerationBuilder()
+                .withKey("dedicated").withOperator("Equal").withValue("gpu").withEffect("NoSchedule")
+                .build();
+        var primitives = new PoolSchedulingPrimitives(Map.of("workload", "gpu"), affinity, java.util.List.of(toleration));
+
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, null, null, null, primitives
+        );
+
+        var revisionSpec = generatedService.getSpec().getTemplate().getSpec();
+        assertThat(revisionSpec.getNodeSelector()).containsEntry("workload", "gpu");
+        assertThat(revisionSpec.getAffinity()).isNotNull();
+        assertThat(revisionSpec.getAffinity().getNodeAffinity()).isNotNull();
+        assertThat(revisionSpec.getTolerations()).hasSize(1);
+        assertThat(revisionSpec.getTolerations().get(0).getKey()).isEqualTo("dedicated");
+    }
+
+    @Test
+    void testServiceConfig_withEmptyPrimitives_doesNotSetSchedulingFields() {
+        var deploymentName = "no-pool-app";
+        var imageName = "my-registry/no-pool-image:v1";
+
+        var generatedService = manifestGenerator.serviceConfig(
+                deploymentName, DM_PREFIX + deploymentName, Collections.emptyList(), Collections.emptyList(), Collections.emptyList(), imageName,
+                null, new Resources(), null, null, null, null, PoolSchedulingPrimitives.EMPTY
+        );
+
+        var revisionSpec = generatedService.getSpec().getTemplate().getSpec();
+        assertThat(revisionSpec.getNodeSelector()).isNullOrEmpty();
+        assertThat(revisionSpec.getAffinity()).isNull();
+        assertThat(revisionSpec.getTolerations()).isNullOrEmpty();
+    }
+
+    private String serialize(Object obj) {
+        return objectMapper.writeValueAsString(obj);
+    }
+
+}

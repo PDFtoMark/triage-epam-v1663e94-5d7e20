@@ -1,0 +1,124 @@
+package com.epam.aidial.deployment.manager.functional;
+
+import com.epam.aidial.deployment.manager.functional.config.H2FunctionalTestConfiguration;
+import com.epam.aidial.deployment.manager.functional.tests.AuditFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.ConfigExportImportFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.ConfigImportValidationFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.DeploymentFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.DeploymentMetricsFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.DeploymentRollbackFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.FullWorkflowWithMockedK8sClientFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.GlobalWhitelistRollbackFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.ImageBuildRunnerFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.ImageDefinitionBuildFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.ImageDefinitionFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.ImageDefinitionRollbackFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.NimRemovalMigrationFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.StopImageBuildFunctionalTest;
+import com.epam.aidial.deployment.manager.functional.tests.TopicFunctionalTest;
+import org.h2.jdbcx.JdbcDataSource;
+import org.junit.jupiter.api.Nested;
+import org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest;
+import org.springframework.context.annotation.Import;
+import org.springframework.test.context.TestPropertySource;
+
+import java.util.UUID;
+import javax.sql.DataSource;
+
+@DataJpaTest
+@TestPropertySource(properties = {
+        "datasource.vendor=H2",
+        "app.image-build-logs-size-limit=3",
+        "app.knative.deploy.undeploy-timeout=600",
+        "app.config.export.file-name=config.json",
+        "app.config.export.zip-name=export.zip",
+        "app.knative.enabled=true",
+        // Legacy flag deliberately kept: NIM was removed in 0.23.0 and the property must be ignored
+        "app.nim.enabled=true",
+        "app.kserve.enabled=true",
+        "DOCKER_REGISTRY=test-docker-registry",
+        "DOCKER_REGISTRY_AUTH=BASIC",
+        "DOCKER_REGISTRY_USER=TestUser",
+        "CILIUM_NETWORK_POLICIES_ENABLED=true",
+        "MCP_PROXY_EXECUTABLE_IMAGE_DEBIAN=test-docker-registry.com/ai/dial/mcp_proxy_debian:latest",
+})
+@Import(H2FunctionalTestConfiguration.class)
+public class H2FunctionalTests extends FunctionalTestSuite {
+
+    @Nested
+    class ImageDefinitionTests extends ImageDefinitionFunctionalTest {
+    }
+
+    @Nested
+    class ImageDefinitionBuildTests extends ImageDefinitionBuildFunctionalTest {
+    }
+
+    @Nested
+    class DeploymentTests extends DeploymentFunctionalTest {
+    }
+
+    @Nested
+    class DeploymentMetricsTests extends DeploymentMetricsFunctionalTest {
+    }
+
+    @Nested
+    class TopicTests extends TopicFunctionalTest {
+    }
+
+    @Nested
+    class ImageBuildRunnerTests extends ImageBuildRunnerFunctionalTest {
+    }
+
+    @Nested
+    class FullWorkflowWithMockedK8sClientTest extends FullWorkflowWithMockedK8sClientFunctionalTest {
+    }
+
+    @Nested
+    class ConfigExportImportTests extends ConfigExportImportFunctionalTest {
+    }
+
+    @Nested
+    class ConfigImportValidationTests extends ConfigImportValidationFunctionalTest {
+    }
+
+    @Nested
+    class AuditTests extends AuditFunctionalTest {
+    }
+
+    @Nested
+    class StopImageBuildTests extends StopImageBuildFunctionalTest {
+    }
+
+    @Nested
+    class DeploymentRollbackTests extends DeploymentRollbackFunctionalTest {
+    }
+
+    @Nested
+    class ImageDefinitionRollbackTests extends ImageDefinitionRollbackFunctionalTest {
+    }
+
+    @Nested
+    class GlobalWhitelistRollbackTests extends GlobalWhitelistRollbackFunctionalTest {
+    }
+
+    @Nested
+    class NimRemovalMigrationTests extends NimRemovalMigrationFunctionalTest {
+        @Override
+        protected DataSource freshDataSource() {
+            var dataSource = new JdbcDataSource();
+            dataSource.setURL("jdbc:h2:mem:nim_removal_" + UUID.randomUUID().toString().replace("-", "") + ";DB_CLOSE_DELAY=-1");
+            dataSource.setUser("sa");
+            return dataSource;
+        }
+
+        @Override
+        protected String vendor() {
+            return "H2";
+        }
+
+        @Override
+        protected String jsonParam() {
+            return "? FORMAT JSON";
+        }
+    }
+}

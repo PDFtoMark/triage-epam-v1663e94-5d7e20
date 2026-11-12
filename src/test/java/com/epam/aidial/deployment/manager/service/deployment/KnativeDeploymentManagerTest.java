@@ -1,0 +1,1040 @@
+package com.epam.aidial.deployment.manager.service.deployment;
+
+import com.epam.aidial.deployment.manager.cleanup.resource.DisposableResourceManager;
+import com.epam.aidial.deployment.manager.cleanup.resource.model.DisposableResource;
+import com.epam.aidial.deployment.manager.configuration.KnativeDeployProperties;
+import com.epam.aidial.deployment.manager.configuration.NodePoolProperties;
+import com.epam.aidial.deployment.manager.dao.repository.DeploymentRepository;
+import com.epam.aidial.deployment.manager.exception.DeploymentException;
+import com.epam.aidial.deployment.manager.exception.EntityNotFoundException;
+import com.epam.aidial.deployment.manager.kubernetes.K8sClient;
+import com.epam.aidial.deployment.manager.kubernetes.knative.K8sKnativeClient;
+import com.epam.aidial.deployment.manager.model.DeploymentMetadata;
+import com.epam.aidial.deployment.manager.model.DeploymentStatus;
+import com.epam.aidial.deployment.manager.model.ImageDefinition;
+import com.epam.aidial.deployment.manager.model.McpImageDefinition;
+import com.epam.aidial.deployment.manager.model.ReconcileConfig;
+import com.epam.aidial.deployment.manager.model.Resources;
+import com.epam.aidial.deployment.manager.model.SimpleEnvVar;
+import com.epam.aidial.deployment.manager.model.SimpleEnvVarValue;
+import com.epam.aidial.deployment.manager.model.deployment.AdapterDeployment;
+import com.epam.aidial.deployment.manager.model.deployment.Deployment;
+import com.epam.aidial.deployment.manager.model.deployment.ImageReferenceSource;
+import com.epam.aidial.deployment.manager.model.deployment.InterceptorDeployment;
+import com.epam.aidial.deployment.manager.model.deployment.InternalImageSource;
+import com.epam.aidial.deployment.manager.model.deployment.McpDeployment;
+import com.epam.aidial.deployment.manager.service.ImageDefinitionService;
+import com.epam.aidial.deployment.manager.service.RegistryPullSecretProvisioner;
+import com.epam.aidial.deployment.manager.service.RegistryPullSecretProvisioner.PullSecretPlan;
+import com.epam.aidial.deployment.manager.service.deployment.healthcheck.HealthCheckProvider;
+import com.epam.aidial.deployment.manager.service.manifest.KnativeManifestGenerator;
+import com.epam.aidial.deployment.manager.service.manifest.ManifestGenerator;
+import com.epam.aidial.deployment.manager.service.pipeline.specification.CiliumNetworkPolicyCreator;
+import com.epam.aidial.deployment.manager.utils.K8sNamingUtils;
+import io.cilium.v2.CiliumNetworkPolicy;
+import io.fabric8.knative.pkg.apis.Condition;
+import io.fabric8.knative.serving.v1.Service;
+import io.fabric8.knative.serving.v1.ServiceStatus;
+import io.fabric8.kubernetes.api.model.Container;
+import io.fabric8.kubernetes.api.model.ContainerStateBuilder;
+import io.fabric8.kubernetes.api.model.ContainerStatus;
+import io.fabric8.kubernetes.api.model.ObjectMeta;
+import io.fabric8.kubernetes.api.model.Pod;
+import io.fabric8.kubernetes.api.model.PodList;
+import io.fabric8.kubernetes.api.model.PodSpec;
+import io.fabric8.kubernetes.api.model.PodStatus;
+import io.fabric8.kubernetes.client.dsl.ContainerResource;
+import io.fabric8.kubernetes.client.dsl.PodResource;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InOrder;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
+
+import java.time.Instant;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+@ExtendWith(MockitoExtension.class)
+class KnativeDeploymentManagerTest {
+
+    private static final String DEPLOYMENT_ID = String.valueOf(UUID.randomUUID());
+    private static final UUID IMAGE_DEFINITION_ID = UUID.randomUUID();
+    private static final int STARTUP_TIMEOUT = 60;
+    private static final int UNDEPLOY_TIMEOUT = 300;
+    private static final int READY_GRACE_PERIOD = 15;
+
+    private static final String SERVICE_URL = "https://service-url.example.com";
+    private static final String SERVICE_NAME = "test-" + DEPLOYMENT_ID;
+    private static final String SERVICE_CONTAINER = "user-container";
+    private static final String IMAGE_NAME = "test-image:latest";
+    private static final String MCP_IMAGE_REFERENCE = "ghcr.io/example/mcp-server:latest";
+    private static final String NAMESPACE = "test-namespace";
+    private static final String POD_NAME = "test-pod";
+
+    @Mock
+    private DisposableResourceManager disposableResourceManager;
+    @Mock
+    private ManifestGenerator manifestGenerator;
+    @Mock
+    private KnativeManifestGenerator knativeManifestGenerator;
+    @Mock
+    private DeploymentRepository deploymentRepository;
+    @Mock
+    private ImageDefinitionService imageDefinitionService;
+    @Mock
+    private ContainerPortResolver containerPortResolver;
+    @Mock
+    private CiliumNetworkPolicyCreator ciliumNetworkPolicyCreator;
+    @Mock
+    private NodePoolProperties nodePoolProperties;
+    @Mock
+    private HealthCheckProvider healthCheckProvider;
+    @Mock
+    private K8sClient k8sClient;
+    @Mock
+    private K8sKnativeClient k8sKnativeClient;
+    @Mock
+    private RegistryPullSecretProvisioner registryPullSecretProvisioner;
+    @Mock
+    private PodResource podResource;
+    @Mock
+    private ContainerResource containerResource;
+    @Mock
+    private CiliumNetworkPolicy ciliumNetworkPolicy;
+
+    private KnativeDeploymentManager knativeDeploymentManager;
+
+    @BeforeAll
+    static void setPrefix() {
+        K8sNamingUtils.setResourceNamePrefix("test");
+    }
+
+    @AfterAll
+    static void dropPrefix() {
+        K8sNamingUtils.setResourceNamePrefix("");
+    }
+
+    @BeforeEach
+    void setUp() {
+        var knativeDeployProperties = new KnativeDeployProperties();
+        knativeDeployProperties.setNamespace(NAMESPACE);
+        knativeDeployProperties.setStartupTimeout(STARTUP_TIMEOUT);
+        knativeDeployProperties.setUndeployTimeout(UNDEPLOY_TIMEOUT);
+        knativeDeployProperties.setReadyGracePeriod(READY_GRACE_PERIOD);
+
+        knativeDeploymentManager = new KnativeDeploymentManager(
+                k8sClient,
+                manifestGenerator,
+                knativeManifestGenerator,
+                deploymentRepository,
+                imageDefinitionService,
+                containerPortResolver,
+                disposableResourceManager,
+                ciliumNetworkPolicyCreator,
+                nodePoolProperties,
+                healthCheckProvider,
+                k8sKnativeClient,
+                knativeDeployProperties,
+                registryPullSecretProvisioner,
+                SERVICE_CONTAINER
+        );
+
+        org.mockito.Mockito.lenient().when(registryPullSecretProvisioner.plan(
+                        org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.anyString(),
+                        org.mockito.ArgumentMatchers.any()))
+                .thenReturn(PullSecretPlan.none());
+
+        TransactionSynchronizationManager.initSynchronization();
+    }
+
+    @AfterEach
+    void tearDown() {
+        TransactionSynchronizationManager.clear();
+    }
+
+    @Test
+    void getActiveInstances_shouldReturnListOfReadyPods() {
+        // Given
+        var podList = new PodList();
+
+        // Create two pods, one ready and one not ready
+        var readyPod = createPod("ready-pod", true);
+        var notReadyPod = createPod("not-ready-pod", false);
+        podList.setItems(List.of(readyPod, notReadyPod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKnativeClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When
+        var result = knativeDeploymentManager.getActiveInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).hasSize(1);
+        assertThat(result.getFirst().getName()).isEqualTo("ready-pod");
+    }
+
+    @Test
+    void getActiveInstances_shouldReturnEmptyListWhenNoPodsFound() {
+        // Given
+        var emptyPodList = new PodList();
+        emptyPodList.setItems(Collections.emptyList());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKnativeClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(emptyPodList);
+
+        // When
+        var result = knativeDeploymentManager.getActiveInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).isEmpty();
+    }
+
+    @Test
+    void getActiveInstances_shouldFilterOutPodsWithoutReadyContainer() {
+        // Given
+        var podList = new PodList();
+
+        // Create a pod with container status but container name doesn't match
+        var pod = createPod("pod-with-wrong-container", true);
+        // Override the container name to simulate a different container
+        pod.getStatus().getContainerStatuses().getFirst().setName("wrong-container-name");
+        podList.setItems(List.of(pod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKnativeClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When/Then
+        assertThatThrownBy(() -> knativeDeploymentManager.getActiveInstances(DEPLOYMENT_ID))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Container " + SERVICE_CONTAINER + " is missing in service pod");
+    }
+
+    @Test
+    void getInstances_shouldReturnPodsWithRestartInfo() {
+        // Given
+        var podList = new PodList();
+        var pod = createPodWithRestartInfo("pod-with-restarts", 5, "OOMKilled", 137, 9);
+        podList.setItems(List.of(pod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKnativeClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When
+        var result = knativeDeploymentManager.getInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).hasSize(1);
+        var podInfo = result.getFirst();
+        assertThat(podInfo.getName()).isEqualTo("pod-with-restarts");
+        assertThat(podInfo.getRestartCount()).isEqualTo(5);
+        assertThat(podInfo.getLastTerminationReason()).isEqualTo("OOMKilled");
+        assertThat(podInfo.getLastExitCode()).isEqualTo(137);
+        assertThat(podInfo.getLastSignal()).isEqualTo(9);
+    }
+
+    @Test
+    void getInstances_shouldReturnPodsWithoutTerminationInfo() {
+        // Given
+        var podList = new PodList();
+        var pod = createPod("pod-no-restarts", true);
+        podList.setItems(List.of(pod));
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKnativeClient.getServicePods(NAMESPACE, SERVICE_NAME)).thenReturn(podList);
+
+        // When
+        var result = knativeDeploymentManager.getInstances(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).hasSize(1);
+        var podInfo = result.getFirst();
+        assertThat(podInfo.getName()).isEqualTo("pod-no-restarts");
+        assertThat(podInfo.getRestartCount()).isEqualTo(0);
+        assertThat(podInfo.getLastTerminationReason()).isNull();
+        assertThat(podInfo.getLastExitCode()).isNull();
+        assertThat(podInfo.getLastSignal()).isNull();
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldReturnContainerResourceForRunningPod() {
+        // Given
+        Pod pod = createPod(POD_NAME, true);
+        pod.getStatus().getContainerStatuses().getFirst()
+                .setState(new ContainerStateBuilder().withNewRunning().endRunning().build());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKnativeClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(pod);
+        when(k8sClient.getPodResource(NAMESPACE, POD_NAME)).thenReturn(podResource);
+        when(podResource.inContainer(SERVICE_CONTAINER)).thenReturn(containerResource);
+
+        // When
+        ContainerResource result = knativeDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false);
+
+        // Then
+        assertThat(result).isEqualTo(containerResource);
+        verify(k8sKnativeClient).getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME);
+        verify(k8sClient).getPodResource(NAMESPACE, POD_NAME);
+        verify(podResource).inContainer(SERVICE_CONTAINER);
+    }
+
+    @Test
+    void getContainerResourceForLogs_shouldThrowExceptionWhenPodNotFound() {
+        // Given
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(createDeployment(DeploymentStatus.RUNNING)));
+        when(k8sKnativeClient.getServicePod(NAMESPACE, SERVICE_NAME, POD_NAME)).thenReturn(null);
+
+        // When / Then
+        assertThatThrownBy(() -> knativeDeploymentManager.getContainerResourceForLogs(DEPLOYMENT_ID, POD_NAME, false))
+                .isInstanceOf(EntityNotFoundException.class)
+                .hasMessage("Pod is not found for deployment '%s'".formatted(DEPLOYMENT_ID));
+    }
+
+    @Test
+    void deploy_shouldDeployKnativeService() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        ImageDefinition imageDefinition = createImageDefinition();
+        Service serviceSpec = new Service();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+        Integer containerPort = 8080;
+        deployment.setContainerPort(containerPort);
+        deployment.setServiceName(null);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(imageDefinitionService.getImageDefinition(IMAGE_DEFINITION_ID)).thenReturn(Optional.of(imageDefinition));
+        when(containerPortResolver.resolveContainerPort(any(), anyInt())).thenReturn(containerPort);
+        when(knativeManifestGenerator.serviceConfig(
+                eq(DEPLOYMENT_ID),
+                eq(SERVICE_NAME),
+                any(),
+                any(),
+                any(),
+                eq(IMAGE_NAME),
+                any(),
+                eq(deployment.getResources()),
+                eq(containerPort),
+                any(),
+                any(),
+                any(),
+                any()
+        )).thenReturn(serviceSpec);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), eq(SERVICE_NAME), anyList(), eq(Set.of(containerPort)))).thenReturn(ciliumNetworkPolicy);
+
+        // When
+        Deployment result = knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        assertThat(result.getStatus()).isEqualTo(DeploymentStatus.PENDING);
+
+        verify(disposableResourceManager).saveKnativeServiceResource(eq(DEPLOYMENT_ID), anyString(), eq(NAMESPACE));
+        verify(k8sKnativeClient).createService(eq(NAMESPACE), eq(serviceSpec));
+        verify(deploymentRepository).updateServiceName(eq(DEPLOYMENT_ID), eq(SERVICE_NAME));
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.PENDING));
+    }
+
+    @Test
+    void deploy_shouldInjectImagePullSecret_whenProvisionerReturnsSecretName() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        deployment.setServiceName(SERVICE_NAME);
+        ImageDefinition imageDefinition = createImageDefinition();
+
+        var serviceSpec = new Service();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+        var revisionTemplate = new io.fabric8.knative.serving.v1.RevisionTemplateSpec();
+        revisionTemplate.setSpec(new io.fabric8.knative.serving.v1.RevisionSpec());
+        var innerSpec = new io.fabric8.knative.serving.v1.ServiceSpec();
+        innerSpec.setTemplate(revisionTemplate);
+        serviceSpec.setSpec(innerSpec);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(imageDefinitionService.getImageDefinition(IMAGE_DEFINITION_ID)).thenReturn(Optional.of(imageDefinition));
+        when(knativeManifestGenerator.serviceConfig(
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(serviceSpec);
+        when(registryPullSecretProvisioner.plan(eq(DEPLOYMENT_ID), eq(NAMESPACE), any()))
+                .thenReturn(PullSecretPlan.provision("test-pull-secret", null));
+
+        // When
+        knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+
+        // Then: the provisioned pull secret name is wired into the Knative RevisionSpec (pre-commit),
+        // independent of the post-commit apply() that writes the secret to the cluster.
+        var pullSecrets = serviceSpec.getSpec().getTemplate().getSpec().getImagePullSecrets();
+        assertThat(pullSecrets).hasSize(1);
+        assertThat(pullSecrets.get(0).getName()).isEqualTo("test-pull-secret");
+    }
+
+    @Test
+    void deploy_shouldApplyPullSecretBeforeCreateService_andCondemnStaleOnlyAfter() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        deployment.setServiceName(SERVICE_NAME);
+        ImageDefinition imageDefinition = createImageDefinition();
+        Service serviceSpec = new Service();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+        var pullSecretPlan = PullSecretPlan.provision("test-pull-secret", null);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(imageDefinitionService.getImageDefinition(IMAGE_DEFINITION_ID)).thenReturn(Optional.of(imageDefinition));
+        when(knativeManifestGenerator.serviceConfig(
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(serviceSpec);
+        when(registryPullSecretProvisioner.plan(eq(DEPLOYMENT_ID), eq(NAMESPACE), any()))
+                .thenReturn(pullSecretPlan);
+
+        // When
+        knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then: the secret is provisioned BEFORE the CRD (so the revision's pods can pull) and stale
+        // secrets are condemned only AFTER the CRD apply succeeded (a failed apply must never condemn
+        // a secret the live revision still references).
+        InOrder order = inOrder(registryPullSecretProvisioner, k8sKnativeClient);
+        order.verify(registryPullSecretProvisioner).apply(eq(DEPLOYMENT_ID), eq(NAMESPACE), eq(pullSecretPlan));
+        order.verify(k8sKnativeClient).createService(eq(NAMESPACE), eq(serviceSpec));
+        order.verify(registryPullSecretProvisioner).condemnStale(eq(DEPLOYMENT_ID), eq(NAMESPACE), eq(pullSecretPlan));
+    }
+
+    @Test
+    void deploy_shouldNotFail_whenCondemnStaleThrows() {
+        // Given: condemnation failure is only a leak (reclaimed on the next redeploy) — it must not
+        // fail the otherwise-successful deploy nor mark its resources for cleanup.
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        deployment.setServiceName(SERVICE_NAME);
+        ImageDefinition imageDefinition = createImageDefinition();
+        Service serviceSpec = new Service();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(imageDefinitionService.getImageDefinition(IMAGE_DEFINITION_ID)).thenReturn(Optional.of(imageDefinition));
+        when(knativeManifestGenerator.serviceConfig(
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(serviceSpec);
+        when(registryPullSecretProvisioner.plan(eq(DEPLOYMENT_ID), eq(NAMESPACE), any()))
+                .thenReturn(PullSecretPlan.provision("test-pull-secret", null));
+        doThrow(new RuntimeException("condemn failed")).when(registryPullSecretProvisioner)
+                .condemnStale(eq(DEPLOYMENT_ID), eq(NAMESPACE), any());
+
+        // When
+        knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then: no DeploymentException propagated, the service was created, nothing marked for cleanup.
+        verify(k8sKnativeClient).createService(eq(NAMESPACE), eq(serviceSpec));
+        verify(disposableResourceManager, never())
+                .markKnativeServiceResourceForCleanup(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void deploy_shouldReturnExistingDeploymentIfAlreadyActive() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        // When
+        Deployment result = knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        verify(k8sKnativeClient, never()).createService(anyString(), any());
+        verify(deploymentRepository, never()).updateServiceName(any(), any());
+        verify(deploymentRepository, never()).updateStatus(any(), any());
+    }
+
+    @Test
+    void deploy_shouldThrowExceptionWhenDeploymentNotFound() {
+        // Given
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.empty());
+
+        // When/Then
+        assertThatThrownBy(() -> knativeDeploymentManager.deploy(DEPLOYMENT_ID))
+                .isInstanceOf(EntityNotFoundException.class)
+                .hasMessageContaining("Deployment not found");
+    }
+
+    @Test
+    void deploy_shouldThrowExceptionWhenImageDefinitionNotFound() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(imageDefinitionService.getImageDefinition(IMAGE_DEFINITION_ID)).thenReturn(Optional.empty());
+
+        // When/Then
+        assertThatThrownBy(() -> knativeDeploymentManager.deploy(DEPLOYMENT_ID))
+                .hasCauseInstanceOf(EntityNotFoundException.class)
+                .hasMessageContaining("Failed to deploy service");
+    }
+
+    @Test
+    void deploy_shouldUseImageReferenceForMcpDeployment() {
+        // Given
+        var deployment = new McpDeployment();
+        deployment.setId(DEPLOYMENT_ID);
+        deployment.setSource(new ImageReferenceSource(MCP_IMAGE_REFERENCE, null));
+        deployment.setStatus(DeploymentStatus.STOPPED);
+        deployment.setMetadata(new DeploymentMetadata());
+        deployment.setResources(new Resources(Collections.emptyMap(), Collections.emptyMap()));
+        deployment.setEnvs(List.of(new SimpleEnvVar("TEST_ENV", new SimpleEnvVarValue("test-value"))));
+        deployment.setAllowedDomains(List.of("test-domain-1"));
+        deployment.setContainerPort(8080);
+        deployment.setServiceName(SERVICE_NAME);
+
+        var serviceSpec = new Service();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), anyInt())).thenReturn(8080);
+        when(knativeManifestGenerator.serviceConfig(
+                eq(DEPLOYMENT_ID),
+                eq(SERVICE_NAME),
+                any(),
+                any(),
+                any(),
+                eq(MCP_IMAGE_REFERENCE),
+                eq(deployment.getScaling()),
+                eq(deployment.getResources()),
+                eq(8080),
+                any(),
+                any(),
+                any(),
+                any()
+        )).thenReturn(serviceSpec);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(false);
+
+        // When
+        knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        verify(imageDefinitionService, never()).getImageDefinition(any());
+        verify(k8sKnativeClient).createService(eq(NAMESPACE), eq(serviceSpec));
+
+        // Should not update serviceName since it is set in existing deployment
+        verify(deploymentRepository, never()).updateServiceName(any(), any());
+    }
+
+    @Test
+    void deploy_shouldUseImageReferenceForAdapterDeployment() {
+        // Given
+        var deployment = new AdapterDeployment();
+        deployment.setId(DEPLOYMENT_ID);
+        deployment.setSource(new ImageReferenceSource(MCP_IMAGE_REFERENCE, null));
+        deployment.setStatus(DeploymentStatus.STOPPED);
+        deployment.setMetadata(new DeploymentMetadata());
+        deployment.setResources(new Resources(Collections.emptyMap(), Collections.emptyMap()));
+        deployment.setEnvs(List.of(new SimpleEnvVar("TEST_ENV", new SimpleEnvVarValue("test-value"))));
+        deployment.setAllowedDomains(List.of("test-domain-1"));
+        deployment.setContainerPort(8080);
+
+        var serviceSpec = new Service();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), anyInt())).thenReturn(8080);
+        when(knativeManifestGenerator.serviceConfig(
+                eq(DEPLOYMENT_ID),
+                eq(SERVICE_NAME),
+                any(),
+                any(),
+                any(),
+                eq(MCP_IMAGE_REFERENCE),
+                eq(deployment.getScaling()),
+                eq(deployment.getResources()),
+                eq(8080),
+                any(),
+                any(),
+                any(),
+                any()
+        )).thenReturn(serviceSpec);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(false);
+
+        // When
+        knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        verify(imageDefinitionService, never()).getImageDefinition(any());
+        verify(k8sKnativeClient).createService(eq(NAMESPACE), eq(serviceSpec));
+    }
+
+    @Test
+    void deploy_shouldUseImageReferenceForInterceptorDeployment() {
+        // Given
+        var deployment = new InterceptorDeployment();
+        deployment.setId(DEPLOYMENT_ID);
+        deployment.setSource(new ImageReferenceSource(MCP_IMAGE_REFERENCE, null));
+        deployment.setStatus(DeploymentStatus.STOPPED);
+        deployment.setMetadata(new DeploymentMetadata());
+        deployment.setResources(new Resources(Collections.emptyMap(), Collections.emptyMap()));
+        deployment.setEnvs(List.of(new SimpleEnvVar("TEST_ENV", new SimpleEnvVarValue("test-value"))));
+        deployment.setAllowedDomains(List.of("test-domain-1"));
+        deployment.setContainerPort(8080);
+
+        var serviceSpec = new Service();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(containerPortResolver.resolveContainerPort(any(), anyInt())).thenReturn(8080);
+        when(knativeManifestGenerator.serviceConfig(
+                eq(DEPLOYMENT_ID),
+                eq(SERVICE_NAME),
+                any(),
+                any(),
+                any(),
+                eq(MCP_IMAGE_REFERENCE),
+                eq(deployment.getScaling()),
+                eq(deployment.getResources()),
+                eq(8080),
+                any(),
+                any(),
+                any(),
+                any()
+        )).thenReturn(serviceSpec);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(false);
+
+        // When
+        knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        verify(imageDefinitionService, never()).getImageDefinition(any());
+        verify(k8sKnativeClient).createService(eq(NAMESPACE), eq(serviceSpec));
+    }
+
+    @Test
+    void deploy_shouldHandleExceptionDuringDeployment() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+        ImageDefinition imageDefinition = createImageDefinition();
+        Service serviceSpec = new Service();
+        serviceSpec.setMetadata(new ObjectMeta());
+        serviceSpec.getMetadata().setName(SERVICE_NAME);
+        Integer containerPort = 8080;
+        deployment.setContainerPort(containerPort);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(imageDefinitionService.getImageDefinition(IMAGE_DEFINITION_ID)).thenReturn(Optional.of(imageDefinition));
+        when(containerPortResolver.resolveContainerPort(any(), anyInt())).thenReturn(containerPort);
+        when(knativeManifestGenerator.serviceConfig(
+                any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()
+        )).thenReturn(serviceSpec);
+        when(ciliumNetworkPolicyCreator.isCiliumNetworkPoliciesEnabled()).thenReturn(true);
+        when(ciliumNetworkPolicyCreator.create(eq(NAMESPACE), anyString(), anyString(), anyList(), eq(Set.of(containerPort)))).thenReturn(ciliumNetworkPolicy);
+        doThrow(new RuntimeException("Test exception")).when(k8sClient).createCiliumNetworkPolicy(eq(NAMESPACE), any());
+
+        // When
+        knativeDeploymentManager.deploy(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        // This should throw the exception
+        var synchronizations = TransactionSynchronizationManager.getSynchronizations();
+        assertThatThrownBy(() -> {
+            for (TransactionSynchronization sync : synchronizations) {
+                sync.afterCommit();
+            }
+        })
+                .isInstanceOf(DeploymentException.class)
+                .hasMessageContaining("Failed to deploy service");
+
+        verify(disposableResourceManager).markKnativeServiceResourceForCleanup(eq(DEPLOYMENT_ID), eq(SERVICE_NAME), eq(NAMESPACE));
+    }
+
+    @Test
+    void undeploy_shouldUndeployKnativeService() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        deployment.setUrl(SERVICE_URL);
+        DisposableResource disposableResource = mock(DisposableResource.class);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(disposableResourceManager.markKnativeServiceResourceForCleanup(DEPLOYMENT_ID, SERVICE_NAME, NAMESPACE))
+                .thenReturn(List.of(disposableResource));
+
+        // When
+        Deployment result = knativeDeploymentManager.undeploy(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        assertThat(result.getStatus()).isEqualTo(DeploymentStatus.STOPPING);
+
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.STOPPING));
+        verify(k8sKnativeClient).deleteServiceAndAllRunningPods(NAMESPACE, SERVICE_NAME);
+        verify(disposableResourceManager).deleteAll(List.of(disposableResource));
+    }
+
+    @Test
+    void undeploy_shouldReturnExistingDeploymentIfAlreadyInactive() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.STOPPED);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        // When
+        Deployment result = knativeDeploymentManager.undeploy(DEPLOYMENT_ID);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        verify(k8sKnativeClient, never()).deleteService(anyString(), anyString());
+        verify(deploymentRepository, never()).updateStatus(any(), any());
+    }
+
+    @Test
+    void undeploy_shouldThrowExceptionWhenDeploymentNotFound() {
+        // Given
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.empty());
+
+        // When/Then
+        assertThatThrownBy(() -> knativeDeploymentManager.undeploy(DEPLOYMENT_ID))
+                .isInstanceOf(EntityNotFoundException.class)
+                .hasMessageContaining("Deployment not found");
+    }
+
+    @Test
+    void undeploy_shouldHandleExceptionDuringUndeployment() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        DisposableResource disposableResource = mock(DisposableResource.class);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(disposableResourceManager.markKnativeServiceResourceForCleanup(DEPLOYMENT_ID, SERVICE_NAME, NAMESPACE))
+                .thenReturn(List.of(disposableResource));
+        doThrow(new RuntimeException("Test exception")).when(k8sKnativeClient)
+                .deleteServiceAndAllRunningPods(NAMESPACE, SERVICE_NAME);
+
+        // When
+        knativeDeploymentManager.undeploy(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        // This should throw the exception
+        var synchronizations = TransactionSynchronizationManager.getSynchronizations();
+        assertThatThrownBy(() -> {
+            for (TransactionSynchronization sync : synchronizations) {
+                sync.afterCommit();
+            }
+        })
+                .isInstanceOf(DeploymentException.class)
+                .hasMessageContaining("Unexpected error while undeploying service");
+    }
+
+    @Test
+    void undeploy_shouldDeleteServiceAndPods() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        DisposableResource disposableResource = mock(DisposableResource.class);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+        when(disposableResourceManager.markKnativeServiceResourceForCleanup(DEPLOYMENT_ID, SERVICE_NAME, NAMESPACE))
+                .thenReturn(List.of(disposableResource));
+
+        // When
+        Deployment result = knativeDeploymentManager.undeploy(DEPLOYMENT_ID);
+
+        // Execute transaction synchronization callbacks manually for unit tests
+        TransactionSynchronizationManager.getSynchronizations().forEach(TransactionSynchronization::afterCommit);
+
+        // Then
+        assertThat(result).isEqualTo(deployment);
+        assertThat(result.getStatus()).isEqualTo(DeploymentStatus.STOPPING);
+
+        verify(k8sKnativeClient).deleteServiceAndAllRunningPods(NAMESPACE, SERVICE_NAME);
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.STOPPING));
+        verify(disposableResourceManager).deleteAll(List.of(disposableResource));
+    }
+
+    @Test
+    void reconcile_shouldReturnStoppingStatusWhenServiceHasDeletionTimestamp() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.RUNNING);
+        Service service = mock(Service.class);
+        ObjectMeta metadata = new ObjectMeta();
+        metadata.setName(SERVICE_NAME);
+        metadata.setDeletionTimestamp(Instant.now().toString());
+        when(service.getMetadata()).thenReturn(metadata);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = ReconcileConfig.<Service>builder()
+                .deploymentId(DEPLOYMENT_ID)
+                .service(service)
+                .serviceIsMissing(false)
+                .initiator("Reconciliation Test")
+                .ignorePendingOnServiceNotFound(false)
+                .build();
+
+        // When
+        boolean result = knativeDeploymentManager.reconcile(reconcileConfig);
+
+        // Then
+        assertThat(result).isTrue();
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.STOPPING));
+    }
+
+    @Test
+    void reconcile_shouldTreatReadyFalseAsPendingWithinGracePeriod() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        Service service = createKnativeServiceWithReadyCondition("False", Instant.now().minusSeconds(5).toString());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = ReconcileConfig.<Service>builder()
+                .deploymentId(DEPLOYMENT_ID)
+                .service(service)
+                .serviceIsMissing(false)
+                .initiator("Reconciliation Test")
+                .ignorePendingOnServiceNotFound(false)
+                .build();
+
+        // When
+        boolean result = knativeDeploymentManager.reconcile(reconcileConfig);
+
+        // Then - status is already PENDING, so no update needed
+        assertThat(result).isFalse();
+        verify(deploymentRepository, never()).updateStatus(any(), any());
+    }
+
+    @Test
+    void reconcile_shouldTreatReadyFalseAsCrashedAfterGracePeriod() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        Service service = createKnativeServiceWithReadyCondition("False", Instant.now().minusSeconds(60).toString());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = ReconcileConfig.<Service>builder()
+                .deploymentId(DEPLOYMENT_ID)
+                .service(service)
+                .serviceIsMissing(false)
+                .initiator("Reconciliation Test")
+                .ignorePendingOnServiceNotFound(false)
+                .build();
+
+        // When
+        boolean result = knativeDeploymentManager.reconcile(reconcileConfig);
+
+        // Then
+        assertThat(result).isTrue();
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.CRASHED));
+    }
+
+    @Test
+    void reconcile_shouldTreatReadyFalseAsCrashedWhenLastTransitionTimeIsNull() {
+        // Given
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        Service service = createKnativeServiceWithReadyCondition("False", null);
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = ReconcileConfig.<Service>builder()
+                .deploymentId(DEPLOYMENT_ID)
+                .service(service)
+                .serviceIsMissing(false)
+                .initiator("Reconciliation Test")
+                .ignorePendingOnServiceNotFound(false)
+                .build();
+
+        // When
+        boolean result = knativeDeploymentManager.reconcile(reconcileConfig);
+
+        // Then
+        assertThat(result).isTrue();
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.CRASHED));
+    }
+
+    @Test
+    void reconcile_shouldTreatReadyFalseAsCrashedWhenGracePeriodDisabled() {
+        // Given - recreate manager with grace period = 0
+        var knativeDeployProperties = new KnativeDeployProperties();
+        knativeDeployProperties.setNamespace(NAMESPACE);
+        knativeDeployProperties.setStartupTimeout(STARTUP_TIMEOUT);
+        knativeDeployProperties.setUndeployTimeout(UNDEPLOY_TIMEOUT);
+        knativeDeployProperties.setReadyGracePeriod(0);
+
+        var managerWithDisabledGrace = new KnativeDeploymentManager(
+                k8sClient,
+                manifestGenerator,
+                knativeManifestGenerator,
+                deploymentRepository,
+                imageDefinitionService,
+                containerPortResolver,
+                disposableResourceManager,
+                ciliumNetworkPolicyCreator,
+                nodePoolProperties,
+                healthCheckProvider,
+                k8sKnativeClient,
+                knativeDeployProperties,
+                registryPullSecretProvisioner,
+                SERVICE_CONTAINER
+        );
+
+        Deployment deployment = createDeployment(DeploymentStatus.PENDING);
+        Service service = createKnativeServiceWithReadyCondition("False", Instant.now().minusSeconds(5).toString());
+
+        when(deploymentRepository.getById(DEPLOYMENT_ID)).thenReturn(Optional.of(deployment));
+
+        var reconcileConfig = ReconcileConfig.<Service>builder()
+                .deploymentId(DEPLOYMENT_ID)
+                .service(service)
+                .serviceIsMissing(false)
+                .initiator("Reconciliation Test")
+                .ignorePendingOnServiceNotFound(false)
+                .build();
+
+        // When
+        boolean result = managerWithDisabledGrace.reconcile(reconcileConfig);
+
+        // Then - even though lastTransitionTime is recent, grace period is disabled → CRASHED
+        assertThat(result).isTrue();
+        verify(deploymentRepository).updateStatus(eq(DEPLOYMENT_ID), eq(DeploymentStatus.CRASHED));
+    }
+
+    private Service createKnativeServiceWithReadyCondition(String status, String lastTransitionTime) {
+        var service = mock(Service.class);
+        var metadata = new ObjectMeta();
+        metadata.setName(SERVICE_NAME);
+        when(service.getMetadata()).thenReturn(metadata);
+
+        var condition = new Condition();
+        condition.setType("Ready");
+        condition.setStatus(status);
+        condition.setLastTransitionTime(lastTransitionTime);
+
+        var serviceStatus = mock(ServiceStatus.class);
+        when(serviceStatus.getConditions()).thenReturn(List.of(condition));
+        when(service.getStatus()).thenReturn(serviceStatus);
+
+        return service;
+    }
+
+    private Deployment createDeployment(DeploymentStatus status) {
+        var deployment = new McpDeployment();
+        deployment.setId(DEPLOYMENT_ID);
+        deployment.setSource(new InternalImageSource(IMAGE_DEFINITION_ID, null, null, null));
+        deployment.setStatus(status);
+        deployment.setMetadata(new DeploymentMetadata());
+        deployment.setResources(new Resources(Collections.emptyMap(), Collections.emptyMap()));
+        deployment.setEnvs(List.of(
+                new SimpleEnvVar("TEST_ENV", new SimpleEnvVarValue("test-value"))
+        ));
+        deployment.setAllowedDomains(List.of("test-domain-1", "test-domain-2"));
+        deployment.setServiceName(SERVICE_NAME);
+        return deployment;
+    }
+
+    private ImageDefinition createImageDefinition() {
+        return McpImageDefinition.builder()
+                .id(IMAGE_DEFINITION_ID)
+                .imageName(IMAGE_NAME)
+                .version("1.0.0")
+                .build();
+    }
+
+    private Pod createPod(String name, boolean ready) {
+        var pod = new Pod();
+        pod.setMetadata(new ObjectMeta());
+        pod.getMetadata().setName(name);
+        pod.getMetadata().setCreationTimestamp(Instant.now().toString());
+
+        var status = new PodStatus();
+        var containerStatus = new ContainerStatus();
+        containerStatus.setName(SERVICE_CONTAINER);
+
+        if (ready) {
+            containerStatus.setState(new ContainerStateBuilder().build()); // No waiting state means ready
+        } else {
+            containerStatus.setState(new ContainerStateBuilder().withNewWaiting().withReason("NotReady").endWaiting().build());
+        }
+
+        status.setContainerStatuses(List.of(containerStatus));
+        pod.setStatus(status);
+
+        var spec = new PodSpec();
+        var container = new Container();
+        container.setName(SERVICE_CONTAINER);
+        spec.setContainers(List.of(container));
+        pod.setSpec(spec);
+
+        return pod;
+    }
+
+    private Pod createPodWithRestartInfo(String name, int restartCount, String terminationReason, Integer exitCode, Integer signal) {
+        var pod = new Pod();
+        pod.setMetadata(new ObjectMeta());
+        pod.getMetadata().setName(name);
+        pod.getMetadata().setCreationTimestamp(Instant.now().toString());
+
+        var status = new PodStatus();
+        var containerStatus = new ContainerStatus();
+        containerStatus.setName(SERVICE_CONTAINER);
+        containerStatus.setRestartCount(restartCount);
+
+        // Set last terminated state
+        var terminatedState = new ContainerStateBuilder()
+                .withNewTerminated()
+                .withReason(terminationReason)
+                .withExitCode(exitCode)
+                .withSignal(signal)
+                .withFinishedAt(Instant.now().toString())
+                .endTerminated()
+                .build();
+        containerStatus.setLastState(terminatedState);
+
+        // Set current state as running
+        containerStatus.setState(new ContainerStateBuilder().build());
+
+        status.setContainerStatuses(List.of(containerStatus));
+        pod.setStatus(status);
+
+        var spec = new PodSpec();
+        var container = new Container();
+        container.setName(SERVICE_CONTAINER);
+        spec.setContainers(List.of(container));
+        pod.setSpec(spec);
+
+        return pod;
+    }
+
+}

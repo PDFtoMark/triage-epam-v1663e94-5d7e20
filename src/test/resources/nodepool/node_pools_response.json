@@ -1,0 +1,14 @@
+{
+  "pools": [
+    {
+      "id": "gpu-pool",
+      "name": "GPU pool",
+      "description": "GPU pool"
+    },
+    {
+      "id": "cpu-pool",
+      "name": "CPU pool",
+      "description": "CPU pool"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "apiVersion": "serving.kserve.io/v1beta1",
+  "kind": "InferenceService",
+  "metadata": {
+    "annotations": {
+      "autoscaling.knative.dev/initial-scale": "1",
+      "serving.knative.dev/progress-deadline": "3630s"
+    },
+    "name": "dm-custom-port-inference-app"
+  },
+  "spec": {
+    "predictor": {
+      "minReplicas": 1,
+      "maxReplicas": 1,
+      "model": {
+        "args": [
+          "--model_name",
+          "custom-port-inference-app"
+        ],
+        "env": [],
+        "modelFormat": {
+          "name": "huggingface"
+        },
+        "ports": [
+          {
+            "containerPort": 9000,
+            "hostPort": 9000,
+            "protocol": "TCP"
+          }
+        ],
+        "resources": {
+          "limits": {},
+          "requests": {}
+        },
+        "storageUri": "s3://my-bucket/port-model"
+      }
+    }
+  }
+}

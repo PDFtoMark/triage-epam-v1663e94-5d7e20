@@ -1,0 +1,46 @@
+{
+  "apiVersion": "serving.kserve.io/v1beta1",
+  "kind": "InferenceService",
+  "metadata": {
+    "annotations": {
+      "autoscaling.knative.dev/initial-scale": "1",
+      "serving.knative.dev/progress-deadline": "3630s"
+    },
+    "name": "dm-basic-inference-app"
+  },
+  "spec": {
+    "predictor": {
+      "minReplicas": 1,
+      "maxReplicas": 1,
+      "model": {
+        "args": [
+          "--model_name",
+          "basic-inference-app"
+        ],
+        "env": [
+          {
+            "name": "SIMPLE_VAR",
+            "value": "simple_value"
+          },
+          {
+            "name": "SECRET_VAR",
+            "valueFrom": {
+              "secretKeyRef": {
+                "key": "secret-key",
+                "name": "my-secret"
+              }
+            }
+          }
+        ],
+        "modelFormat": {
+          "name": "huggingface"
+        },
+        "resources": {
+          "limits": {},
+          "requests": {}
+        },
+        "storageUri": "s3://my-bucket/my-model"
+      }
+    }
+  }
+}
